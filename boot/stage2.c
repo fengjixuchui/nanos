@@ -1,12 +1,14 @@
-#include <runtime.h>
+#include <kernel.h>
 #include <tfs.h>
 #include <elf64.h>
 #include <page.h>
 #include <region.h>
-#include <x86_64.h>
 #include <kvm_platform.h>
 #include <serial.h>
 #include <drivers/ata.h>
+
+//#define STAGE2_DEBUG
+//#define DEBUG_STAGE2_ALLOC
 
 #ifdef STAGE2_DEBUG
 # define stage2_debug rprintf
@@ -28,7 +30,7 @@ extern void run64(u32 entry);
  */
 
 #define EARLY_WORKING_SIZE   KB
-#define STACKLEN             (8 * PAGESIZE)
+#define STACKLEN             (STAGE2_STACK_PAGES * PAGESIZE)
 
 #define REAL_MODE_STACK_SIZE 0x1000
 #define SCRATCH_BASE         0x500
@@ -182,9 +184,12 @@ static u64 working_saved_base;
 closure_function(0, 4, void, kernel_elf_map,
                  u64, vaddr, u64, paddr, u64, size, u64, flags)
 {
+    stage2_debug("%s: vaddr 0x%lx, paddr 0x%lx, size 0x%lx, flags 0x%lx\n",
+                 __func__, vaddr, paddr, size, flags);
+
     if (paddr == INVALID_PHYSICAL) {
         /* bss */
-        paddr = allocate_u64(heap_physical(&kh), size);
+        paddr = allocate_u64(heap_backed(&kh), size);
         assert(paddr != INVALID_PHYSICAL);
         zero(pointer_from_u64(paddr), size);
     }
@@ -199,6 +204,7 @@ closure_function(0, 1, status, kernel_read_complete,
     /* save kernel elf image for use in stage3 (for symbol data) */
     create_region(u64_from_pointer(buffer_ref(kb, 0)), pad(buffer_length(kb), PAGESIZE), REGION_KERNIMAGE);
 
+    stage2_debug("%s: load_elf\n", __func__);
     void *k = load_elf(kb, 0, stack_closure(kernel_elf_map));
     if (!k) {
         halt("kernel elf parse failed\n");
@@ -208,6 +214,7 @@ closure_function(0, 1, status, kernel_read_complete,
     assert(working_saved_base);
     create_region(working_saved_base, STAGE2_WORKING_HEAP_SIZE, REGION_PHYSICAL);
 
+    stage2_debug("%s: run64, start address %p\n", __func__, k);
     run64(u64_from_pointer(k));
     halt("failed to start long mode\n");
 }
@@ -231,9 +238,8 @@ static void tagged_deallocate(heap h, u64 a, bytes length)
     deallocate_u64(ta->parent, a - 1, length + 1);
 }
 
-heap allocate_tagged_region(kernel_heaps kh, u64 tag)
+static heap allocate_tagged_region(heap h, u64 tag)
 {
-    heap h = heap_general(kh);
     tagged_allocator ta = allocate(h, sizeof(struct tagged_allocator));
     ta->h.alloc = tagged_allocate;
     ta->h.dealloc = tagged_deallocate;
@@ -252,11 +258,13 @@ region fsregion()
 }
 
 closure_function(4, 2, void, filesystem_initialized,
-                 heap, h, heap, physical, tuple, root, buffer_handler, complete,
+                 heap, h, heap, backed, tuple, root, buffer_handler, complete,
                  filesystem, fs, status, s)
 {
+    if (!is_ok(s))
+        halt("unable to open filesystem: %v\n", s);
     filesystem_read_entire(fs, lookup(bound(root), sym(kernel)),
-                           bound(physical),
+                           bound(backed),
                            bound(complete),
                            closure(bound(h), fail));
 }
@@ -267,19 +275,20 @@ void newstack()
     u32 fs_offset = SECTOR_SIZE + fsregion()->length; // MBR + stage2
     tuple root = allocate_tuple();
     heap h = heap_general(&kh);
-    heap physical = heap_physical(&kh);
     buffer_handler bh = closure(h, kernel_read_complete);
 
     setup_page_tables();
 
     create_filesystem(h,
                       SECTOR_SIZE,
+                      SECTOR_SIZE,
                       infinity,
                       0,         /* ignored in boot */
                       get_stage2_disk_read(h, fs_offset),
                       closure(h, stage2_empty_write),
                       root,
-                      closure(h, filesystem_initialized, h, physical, root, bh));
+                      false,
+                      closure(h, filesystem_initialized, h, heap_backed(&kh), root, bh));
     
     halt("kernel failed to execute\n");
 }
@@ -310,6 +319,10 @@ static u64 stage2_allocator(heap h, bytes b)
     return result;
 }
 
+#define CR4_OSFXSR (1<<9)
+#define CR4_OSXMMEXCPT (1<<10)
+#define CR4_OSXSAVE (1<<18)
+
 void centry()
 {
     working_heap.alloc = stage2_allocator;
@@ -317,17 +330,21 @@ void centry()
     working_p = u64_from_pointer(early_working);
     working_end = working_p + EARLY_WORKING_SIZE;
     kh.general = &working_heap;
-    init_runtime(&kh); /* we know only general is used */
+    init_runtime(&working_heap);
+    init_tuples(allocate_tagged_region(&working_heap, tag_tuple));
+    init_symbols(allocate_tagged_region(&working_heap, tag_symbol), &working_heap);
     init_extra_prints();
     stage2_debug("%s\n", __func__);
 
     u32 cr0, cr4;
     mov_from_cr("cr0", cr0);
     mov_from_cr("cr4", cr4);
+    // make a header
     cr0 &= ~(1<<2); // clear EM
     cr0 |= 1<<1; // set MP EM
-    cr4 |= 1<<9; // set osfxsr
-    cr4 |= 1<<10; // set osxmmexcpt
+    cr4 |= CR4_OSFXSR;
+    cr4 |= CR4_OSXMMEXCPT;
+    cr4 |= CR4_OSXSAVE;
 //    cr4 |= 1<<20; // set smep - use once we do kernel / user split
     mov_to_cr("cr0", cr0);
     mov_to_cr("cr4", cr4);    
@@ -358,20 +375,20 @@ void centry()
         }
     }
 
-    kh.physical = region_allocator(&working_heap, PAGESIZE, REGION_PHYSICAL);
-    assert(kh.physical);
+    kh.backed = region_allocator(&working_heap, PAGESIZE, REGION_PHYSICAL);
+    assert(kh.backed != INVALID_ADDRESS);
 
     /* allocate identity region for page tables */
-    identity_base = allocate_u64(kh.physical, IDENTITY_HEAP_SIZE);
+    identity_base = allocate_u64(kh.backed, IDENTITY_HEAP_SIZE);
     assert(identity_base != INVALID_PHYSICAL);
 
     /* allocate stage2 (and early stage3) stack */
-    stack_base = allocate_u64(kh.physical, STACKLEN);
+    stack_base = allocate_u64(kh.backed, STACKLEN);
     assert(stack_base != INVALID_PHYSICAL);
     create_region(stack_base, STACKLEN, REGION_RECLAIM);
 
     /* allocate larger space for stage2 working (to accomodate tfs meta, etc.) */
-    working_p = allocate_u64(kh.physical, STAGE2_WORKING_HEAP_SIZE);
+    working_p = allocate_u64(kh.backed, STAGE2_WORKING_HEAP_SIZE);
     assert(working_p != INVALID_PHYSICAL);
     working_saved_base = working_p;
     working_end = working_p + STAGE2_WORKING_HEAP_SIZE;

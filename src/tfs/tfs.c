@@ -76,39 +76,6 @@ void filesystem_write_eav(filesystem fs, tuple t, symbol a, value v, status_hand
     log_write_eav(fs->tl, t, a, v, sh);
 }
 
-static symbol fs_get_parent_child(filesystem fs, tuple cwd, const char *fp,
-        tuple *parent, tuple *child)
-{
-    int fp_len = runtime_strlen(fp);
-    char *fp_copy = allocate(fs->h, fp_len + 1);
-    assert(fp_copy != INVALID_ADDRESS);
-    runtime_memcpy(fp_copy, fp, fp_len);
-    fp_copy[fp_len] = '\0';
-    char *token, *rest = fp_copy;
-    symbol child_sym = 0;
-    while ((token = runtime_strtok_r(rest, "/", &rest))) {
-        symbol s = sym_this(token);
-        tuple t = lookup(cwd, s);
-        if (*rest != '\0') {
-            if (!t) {   /* entry not found */
-                break;
-            }
-            cwd = t;
-            continue;
-        }
-        if (parent) {
-            *parent = cwd;
-        }
-        if (child) {
-            *child = t;
-        }
-        child_sym = s;
-        break;
-    }
-    deallocate(fs->h, fp_copy, fp_len + 1);
-    return child_sym;
-}
-
 /* This can evolve into / be replaced by a more general page / buffer
    chace interface. We should be able to maintain and recycle dma
    buffers for anything in the system, or at least virtio. These
@@ -129,7 +96,7 @@ static fs_dma_buf fs_allocate_dma_buffer(filesystem fs, extent e, range i)
     fs_dma_buf db = allocate(fs->h, sizeof(struct fs_dma_buf));
     if (db == INVALID_ADDRESS)
         return db;
-    bytes blocksize = fs->blocksize;
+    bytes blocksize = fs_blocksize(fs);
     bytes absolute = e->block_start + i.start - e->node.r.start;
     db->start_offset = absolute & (blocksize - 1);
     db->data_length = range_span(i);
@@ -207,7 +174,7 @@ closure_function(4, 1, void, fs_read_extent,
     tfs_debug("fs_read_extent: q %R, ex %R, blocks %R, start_offset %ld, i %R, "
               "target_offset %ld, target_start %p, length %ld, blocksize %ld\n",
               q, node->r, db->blocks, db->start_offset, i,
-              target_offset, target_start, db->data_length, (u64)fs->blocksize);
+              target_offset, target_start, db->data_length, fs_blocksize(fs));
 
     status_handler f = apply_merge(bound(m));
     fetch_and_add(&target->end, db->data_length);
@@ -313,7 +280,7 @@ void filesystem_read_entire(filesystem fs, tuple t, heap bufheap, buffer_handler
         return;
     }
 
-    u64 length = pad(fsfile_get_length(f), fs->blocksize);
+    u64 length = pad(fsfile_get_length(f), fs_blocksize(fs));
     buffer b = allocate_buffer(bufheap, pad(length, bufheap->pagesize));
     filesystem_read_internal(fs, f, b, length, 0, closure(fs->h, read_entire_complete, c, b, sh));
 }
@@ -366,7 +333,7 @@ closure_function(4, 1, void, fs_write_extent_aligned_closure,
 static void fs_write_extent_read_block(filesystem fs, fs_dma_buf db, u64 offset_block, status_handler sh)
 {
     u64 absolute_block = db->blocks.start + offset_block;
-    void * buf = db->buf + (offset_block * fs->blocksize);
+    void * buf = db->buf + bytes_from_sectors(fs, offset_block);
     range r = irange(absolute_block, absolute_block + 1);
     tfs_debug("fs_write_extent_read_block: sector range %R, buf %p\n", r, buf);
     apply(fs->r, buf, r, sh);
@@ -397,7 +364,7 @@ static void fs_write_extent(filesystem fs, buffer source, merge m, range q, rmno
 
     /* Check for unaligned block writes and initiate reads for them.
        This would all be obviated by a diskcache. */
-    boolean tail_rmw = ((db->data_length + db->start_offset) & (fs->blocksize - 1)) != 0 &&
+    boolean tail_rmw = ((db->data_length + db->start_offset) & (fs_blocksize(fs) - 1)) != 0 &&
         (i.end != node->r.end); /* no need to rmw tail if we're at the end of the extent */
     boolean plural = range_span(db->blocks) > 1;
 
@@ -461,7 +428,7 @@ static extent create_extent(fsfile f, range r, merge m)
     tfs_debug("create_extent: align %d, offset %ld, length %ld, alloc_order %ld, alloc_bytes %ld\n",
               alignment, r.start, length, alloc_order, alloc_bytes);
 
-    u64 block_start = allocate_u64(f->fs->storage, alloc_bytes);
+    u64 block_start = allocate_u64((heap)f->fs->storage, alloc_bytes);
     if (block_start == u64_from_pointer(INVALID_ADDRESS)) {
         msg_err("out of storage");
         return INVALID_ADDRESS;
@@ -504,6 +471,15 @@ static inline boolean ingest_parse_int(tuple value, symbol s, u64 * i)
     return retval;
 }
 
+boolean filesystem_reserve_storage(filesystem fs, u64 start, u64 length)
+{
+#ifndef BOOT
+    if (fs->w)
+        return id_heap_set_area(fs->storage, start, length, true, true);
+#endif
+    return true;
+}
+
 void ingest_extent(fsfile f, symbol off, tuple value)
 {
     tfs_debug("ingest_extent: f %p, off %b, value %v\n", f, symbol_string(off), value);
@@ -515,13 +491,12 @@ void ingest_extent(fsfile f, symbol off, tuple value)
     assert(ingest_parse_int(value, sym(allocated), &allocated));
     tfs_debug("   file offset %ld, length %ld, block_start 0x%lx, allocated %ld\n",
               file_offset, length, block_start, allocated);
-#ifndef BOOT
-    if (!id_heap_set_area(f->fs->storage, block_start, allocated, true, true)) {
+
+    if (!filesystem_reserve_storage(f->fs, block_start, allocated)) {
         /* soft error... */
         msg_err("unable to reserve storage at start 0x%lx, len 0x%lx\n",
                 block_start, allocated);
     }
-#endif
     range r = irange(file_offset, file_offset + length);
     extent ex = allocate_extent(f->fs->h, r, block_start, allocated);
     if (ex == INVALID_ADDRESS)
@@ -730,14 +705,14 @@ boolean filesystem_truncate(filesystem fs, fsfile f, u64 len,
     return false;
 }
 
-boolean filesystem_flush(filesystem fs, tuple t, status_handler completion)
+void filesystem_flush(filesystem fs, tuple t, status_handler completion)
 {
     /* A write() call returns after everything is sent to disk, so nothing to
-     * do here. The only work that might be pending is when directory entries
-     * are modified, see do_mkentry(); to deal with that, flush the filesystem
-     * log.
+     * do here. The only work that might be pending is when a file is created,
+     * see the call to filesystem_creat() from unix/syscall.c; to deal with
+     * that, flush the filesystem log.
      */
-    return log_flush_complete(fs->tl, completion);
+    log_flush_complete(fs->tl, completion);
 }
 
 fsfile allocate_fsfile(filesystem fs, tuple md)
@@ -889,7 +864,8 @@ fs_status filesystem_mkentry(filesystem fs, tuple cwd, const char *fp, tuple ent
     return status;
 }
 
-fs_status filesystem_mkdir(filesystem fs, tuple cwd, const char *fp, boolean persistent)
+fs_status filesystem_mkdirpath(filesystem fs, tuple cwd, const char *fp,
+        boolean persistent)
 {
     tuple dir = allocate_tuple();
     /* 'make it a folder' by attaching a children node to the tuple */
@@ -898,7 +874,17 @@ fs_status filesystem_mkdir(filesystem fs, tuple cwd, const char *fp, boolean per
     return filesystem_mkentry(fs, cwd, fp, dir, persistent, false);
 }
 
-fs_status filesystem_creat(filesystem fs, tuple cwd, const char *fp, boolean persistent)
+tuple filesystem_mkdir(filesystem fs, tuple parent, const char *name,
+        status_handler completion)
+{
+    tuple dir = allocate_tuple();
+    table_set(dir, sym(children), allocate_tuple());
+    fs_set_dir_entry(fs, parent, sym_this(name), dir, completion);
+    return dir;
+}
+
+tuple filesystem_creat(filesystem fs, tuple parent, const char *name,
+        status_handler completion)
 {
     tuple dir = allocate_tuple();
     static buffer off = 0;
@@ -913,55 +899,46 @@ fs_status filesystem_creat(filesystem fs, tuple cwd, const char *fp, boolean per
     fsfile f = allocate_fsfile(fs, dir);
     fsfile_set_length(f, 0);
 
-    return filesystem_mkentry(fs, cwd, fp, dir, persistent, false);
+    fs_set_dir_entry(fs, parent, sym_this(name), dir, completion);
+    return dir;
 }
 
-void filesystem_delete(filesystem fs, tuple cwd, const char *fp,
+tuple filesystem_symlink(filesystem fs, tuple parent, const char *name,
+        const char *target, status_handler completion)
+{
+    tuple link = allocate_tuple();
+    table_set(link, sym(linktarget), buffer_cstring(fs->h, target));
+    fs_set_dir_entry(fs, parent, sym_this(name), link, completion);
+    return link;
+}
+
+void filesystem_delete(filesystem fs, tuple parent, symbol sym,
         status_handler completion)
 {
-    tuple parent;
-    symbol child_sym = fs_get_parent_child(fs, cwd, fp, &parent, 0);
-    if (!child_sym) {
-        return;
-    }
-    fs_set_dir_entry(fs, parent, child_sym, 0, completion);
+    fs_set_dir_entry(fs, parent, sym, 0, completion);
 }
 
-void filesystem_rename(filesystem fs, tuple oldwd, const char *oldfp,
-        tuple newwd, const char *newfp, status_handler completion)
+void filesystem_rename(filesystem fs, tuple oldparent, symbol oldsym,
+        tuple newparent, const char *newname, status_handler completion)
 {
-    tuple oldparent;
-    tuple t;
-    symbol oldchild_sym = fs_get_parent_child(fs, oldwd, oldfp, &oldparent, &t);
-    if (!oldchild_sym) {
-        return;
-    }
-    tuple newparent;
-    symbol newchild_sym = fs_get_parent_child(fs, newwd, newfp, &newparent, 0);
-    if (!newchild_sym) {
-        return;
-    }
-    fs_set_dir_entry(fs, oldparent, oldchild_sym, 0, 0);
+    tuple t = lookup(oldparent, oldsym);
+    assert(t);
+    symbol newchild_sym = sym_this(newname);
+    fs_set_dir_entry(fs, oldparent, oldsym, 0, 0);
     fs_set_dir_entry(fs, newparent, newchild_sym, t, completion);
 }
 
-void filesystem_exchange(filesystem fs, tuple wd1, const char *fp1,
-        tuple wd2, const char *fp2, status_handler completion)
+void filesystem_exchange(filesystem fs, tuple parent1, symbol sym1,
+        tuple parent2, symbol sym2, status_handler completion)
 {
-    tuple parent1;
     tuple child1;
-    symbol child1_sym = fs_get_parent_child(fs, wd1, fp1, &parent1, &child1);
-    if (!child1_sym) {
-        return;
-    }
-    tuple parent2;
+    child1 = lookup(parent1, sym1);
+    assert(child1);
     tuple child2;
-    symbol child2_sym = fs_get_parent_child(fs, wd2, fp2, &parent2, &child2);
-    if (!child2_sym) {
-        return;
-    }
-    fs_set_dir_entry(fs, parent1, child1_sym, child2, 0);
-    fs_set_dir_entry(fs, parent2, child2_sym, child1, completion);
+    child2 = lookup(parent2, sym2);
+    assert(child2);
+    fs_set_dir_entry(fs, parent1, sym1, child2, 0);
+    fs_set_dir_entry(fs, parent2, sym2, child1, completion);
 }
 
 fsfile fsfile_from_node(filesystem fs, tuple n)
@@ -984,11 +961,13 @@ closure_function(0, 2, void, ignore_io,
 
 void create_filesystem(heap h,
                        u64 alignment,
+                       u64 blocksize,
                        u64 size,
                        heap dma,
                        block_io read,
                        block_io write,
                        tuple root,
+                       boolean initialize,
                        filesystem_complete complete)
 {
     tfs_debug("create_filesystem: ...\n");
@@ -1002,13 +981,13 @@ void create_filesystem(heap h,
     fs->w = write;
     fs->root = root;
     fs->alignment = alignment;
-    fs->blocksize = SECTOR_SIZE;
+    assert((blocksize & (blocksize - 1)) == 0); /* power of 2 */
+    fs->blocksize_order = find_order(blocksize);
 #ifndef BOOT
-    fs->storage = create_id_heap(h, 0, size, SECTOR_SIZE);
+    fs->storage = create_id_heap(h, h, 0, size, fs_blocksize(fs));
     assert(fs->storage != INVALID_ADDRESS);
-    assert(id_heap_set_area(fs->storage, 0, INITIAL_LOG_SIZE, true, true));
 #endif
-    fs->tl = log_create(h, fs, closure(h, log_complete, complete, fs));
+    fs->tl = log_create(h, fs, initialize, closure(h, log_complete, complete, fs));
 }
 
 tuple filesystem_getroot(filesystem fs)

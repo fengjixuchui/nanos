@@ -1,4 +1,3 @@
-#pragma once
 typedef struct filesystem *filesystem;
 typedef struct fsfile *fsfile;
 
@@ -14,11 +13,13 @@ extern io_status_handler ignore_io_status;
 
 void create_filesystem(heap h,
                        u64 alignment,
+                       u64 blocksize,
                        u64 size,
                        heap dma,
-                       block_io read,
+                       block_io read, /* read and write are optional */
                        block_io write,
                        tuple root,
+                       boolean initialize,
                        filesystem_complete complete);
 
 // there is a question as to whether tuple->fs file should be mapped inside out outside the filesystem
@@ -27,7 +28,7 @@ void filesystem_read(filesystem fs, tuple t, void *dest, u64 offset, u64 length,
 void filesystem_write(filesystem fs, tuple t, buffer b, u64 offset, io_status_handler completion);
 boolean filesystem_truncate(filesystem fs, fsfile f, u64 len,
         status_handler completion);
-boolean filesystem_flush(filesystem fs, tuple t, status_handler completion);
+void filesystem_flush(filesystem fs, tuple t, status_handler completion);
 u64 fsfile_get_length(fsfile f);
 void fsfile_set_length(fsfile f, u64);
 fsfile fsfile_from_node(filesystem fs, tuple n);
@@ -48,14 +49,20 @@ typedef enum {
 
 fs_status filesystem_mkentry(filesystem fs, tuple cwd, const char *fp, tuple entry,
     boolean persistent, boolean recursive);
-fs_status filesystem_mkdir(filesystem fs, tuple cwd, const char *fp, boolean persistent);
-fs_status filesystem_creat(filesystem fs, tuple cwd, const char *fp, boolean persistent);
-void filesystem_delete(filesystem fs, tuple cwd, const char *fp,
+fs_status filesystem_mkdirpath(filesystem fs, tuple cwd, const char *fp,
+        boolean persistent);
+tuple filesystem_mkdir(filesystem fs, tuple parent, const char *name,
+        status_handler completion);
+tuple filesystem_creat(filesystem fs, tuple parent, const char *name,
+        status_handler completion);
+tuple filesystem_symlink(filesystem fs, tuple parent, const char *name,
+        const char *target, status_handler completion);
+void filesystem_delete(filesystem fs, tuple parent, symbol sym,
     status_handler completion);
-void filesystem_rename(filesystem fs, tuple oldwd, const char *oldfp,
-        tuple newwd, const char *newfp, status_handler completion);
-void filesystem_exchange(filesystem fs, tuple wd1, const char *fp1,
-        tuple wd2, const char *fp2, status_handler completion);
+void filesystem_rename(filesystem fs, tuple oldparent, symbol oldsym,
+        tuple newparent, const char *newname, status_handler completion);
+void filesystem_exchange(filesystem fs, tuple parent1, symbol sym1,
+        tuple parent2, symbol sym2, status_handler completion);
 
 tuple filesystem_getroot(filesystem fs);
 extern const char *gitversion;
