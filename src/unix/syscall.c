@@ -61,13 +61,10 @@ void register_other_syscalls(struct syscall *map)
     register_syscall(map, setfsuid, 0);
     register_syscall(map, setfsgid, 0);
     register_syscall(map, getsid, 0);
-    register_syscall(map, utime, 0);
     register_syscall(map, mknod, 0);
     register_syscall(map, uselib, 0);
     register_syscall(map, personality, 0);
     register_syscall(map, ustat, 0);
-    register_syscall(map, statfs, 0);
-    register_syscall(map, fstatfs, 0);
     register_syscall(map, sysfs, 0);
     register_syscall(map, getpriority, 0);
     register_syscall(map, setpriority, 0);
@@ -140,7 +137,6 @@ void register_other_syscalls(struct syscall *map)
     register_syscall(map, semtimedop, 0);
     register_syscall(map, fadvise64, 0);
     register_syscall(map, clock_settime, 0);
-    register_syscall(map, utimes, 0);
     register_syscall(map, vserver, 0);
     register_syscall(map, mbind, 0);
     register_syscall(map, set_mempolicy, 0);
@@ -552,6 +548,9 @@ closure_function(2, 6, sysreturn, file_read,
     }
 
     if (offset < f->length) {
+        if ((f->length > 0) && !(f->f.flags & O_NOATIME)) {
+            filesystem_update_atime(t->p->fs, f->n);
+        }
         file_op_begin(t);
         filesystem_read(t->p->fs, f->n, dest, length, offset,
                         closure(heap_general(get_kernel_heaps()),
@@ -581,8 +580,18 @@ closure_function(2, 6, sysreturn, file_write,
                length, f->length);
     heap h = heap_general(get_kernel_heaps());
 
-    u64 final_length = PAD_WRITES ? pad(length, SECTOR_SIZE) : length;
-    void *buf = allocate(h, final_length);
+    u64 final_length = 0;
+    void *buf = INVALID_ADDRESS;
+    while (length != 0) {
+        final_length = PAD_WRITES ? pad(length, SECTOR_SIZE) : length;
+        buf = allocate(h, final_length);
+        if (buf != INVALID_ADDRESS) {
+            break;
+        } else {
+            /* Couldn't allocate that much memory, retry with a smaller size. */
+            length >>= 1;
+        }
+    }
 
     /* XXX we shouldn't need to copy here, however if we at some point
        want to support non-blocking, we'll need to fix the unaligned
@@ -602,6 +611,9 @@ closure_function(2, 6, sysreturn, file_write,
     buffer b = wrap_buffer(h, buf, final_length);
     thread_log(t, "%s: b_ref: %p", __func__, buffer_ref(b, 0));
 
+    if (final_length > 0) {
+        filesystem_update_mtime(t->p->fs, f->n);
+    }
     file_op_begin(t);
     filesystem_write(t->p->fs, f->n, b, offset,
                      closure(h, file_op_complete, t, f, fsf, is_file_offset,
@@ -688,6 +700,7 @@ sysreturn open_internal(tuple cwd, const char *name, int flags, int mode)
             n = filesystem_creat(current->p->fs, parent,
                     filename_from_path(name), ignore_status);
             if (n) {
+                filesystem_update_mtime(current->p->fs, parent);
                 ret = 0;
             } else {
                 ret = -ENOMEM;
@@ -825,6 +838,7 @@ static sysreturn mkdir_internal(tuple cwd, const char *pathname, int mode)
     if ((ret != -ENOENT) || !parent) {
         return set_syscall_return(current, ret);
     }
+    filesystem_update_mtime(current->p->fs, parent);
     file_op_begin(current);
     filesystem_mkdir(current->p->fs, parent, filename_from_path(pathname),
             closure(heap_general(get_kernel_heaps()), mkdir_complete, current));
@@ -940,6 +954,7 @@ sysreturn getdents(int fd, struct linux_dirent *dirp, unsigned int count)
     }
 
 done:
+    filesystem_update_atime(current->p->fs, f->n);
     f->offset = read_sofar;
     if (r < 0 && written_sofar == 0)
         return -EINVAL;
@@ -1005,6 +1020,7 @@ sysreturn getdents64(int fd, struct linux_dirent64 *dirp, unsigned int count)
     }
 
 done:
+    filesystem_update_atime(current->p->fs, f->n);
     f->offset = read_sofar;
     if (r < 0 && written_sofar == 0)
         return -EINVAL;
@@ -1070,6 +1086,7 @@ static sysreturn truncate_internal(tuple t, long length)
         /* Nothing to do. */
         return 0;
     }
+    filesystem_update_mtime(current->p->fs, t);
     return file_op_maybe_sleep(current);
 }
 
@@ -1158,6 +1175,7 @@ sysreturn openat(int dirfd, const char *name, int flags, int mode)
 
 static void fill_stat(int type, tuple n, struct stat *s)
 {
+    zero(s, sizeof(struct stat));
     switch (type) {
     case FDESC_TYPE_REGULAR:
         s->st_mode = S_IFREG | 0644;
@@ -1182,13 +1200,20 @@ static void fill_stat(int type, tuple n, struct stat *s)
         s->st_mode = S_IFLNK;
         break;
     }
-    s->st_dev = 0;
     s->st_ino = u64_from_pointer(n);
-    s->st_size = 0;
     if (type == FDESC_TYPE_REGULAR) {
         fsfile f = fsfile_from_node(current->p->fs, n);
         if (f)
             s->st_size = fsfile_get_length(f);
+    }
+    if (n) {
+        struct timespec ts;
+        timespec_from_time(&ts, filesystem_get_atime(current->p->fs, n));
+        s->st_atime = ts.tv_sec;
+        s->st_atime_nsec = ts.tv_nsec;
+        timespec_from_time(&ts, filesystem_get_mtime(current->p->fs, n));
+        s->st_mtime = ts.tv_sec;
+        s->st_mtime_nsec = ts.tv_nsec;
     }
     thread_log(current, "st_ino %lx, st_mode 0x%x, st_size %lx",
             s->st_ino, s->st_mode, s->st_size);
@@ -1198,8 +1223,19 @@ static sysreturn fstat(int fd, struct stat *s)
 {
     thread_log(current, "fd %d, stat %p", fd, s);
     fdesc f = resolve_fd(current->p, fd);
-    zero(s, sizeof(struct stat));
-    fill_stat(f->type, ((file)f)->n, s);
+    tuple n;
+    switch (f->type) {
+    case FDESC_TYPE_REGULAR:
+    case FDESC_TYPE_DIRECTORY:
+    case FDESC_TYPE_SPECIAL:
+    case FDESC_TYPE_SYMLINK:
+        n = ((file)f)->n;
+        break;
+    default:
+        n = 0;
+        break;
+    }
+    fill_stat(f->type, n, s);
     return 0;
 }
 
@@ -1399,6 +1435,7 @@ static sysreturn readlink_internal(tuple cwd, const char *pathname, char *buf,
         len = bufsiz;
     }
     runtime_memcpy(buf, buffer_ref(target, 0), len);
+    filesystem_update_atime(current->p->fs, n);
     return set_syscall_return(current, len);
 }
 
@@ -1455,6 +1492,7 @@ static sysreturn unlink_internal(tuple cwd, const char *pathname)
     if (is_dir(n)) {
         return set_syscall_error(current, EISDIR);
     }
+    filesystem_update_mtime(current->p->fs, parent);
     file_op_begin(current);
     filesystem_delete(current->p->fs, parent, lookup_sym(parent, n),
             closure(heap_general(get_kernel_heaps()), file_delete_complete,
@@ -1483,6 +1521,7 @@ static sysreturn rmdir_internal(tuple cwd, const char *pathname)
             return set_syscall_error(current, ENOTEMPTY);
         }
     }
+    filesystem_update_mtime(current->p->fs, parent);
     file_op_begin(current);
     filesystem_delete(current->p->fs, parent, lookup_sym(parent, n),
             closure(heap_general(get_kernel_heaps()), file_delete_complete,
@@ -1571,6 +1610,8 @@ static sysreturn rename_internal(tuple oldwd, const char *oldpath, tuple newwd,
     if (filepath_is_ancestor(oldwd, oldpath, newwd, newpath)) {
         return set_syscall_error(current, EINVAL);
     }
+    filesystem_update_mtime(current->p->fs, oldparent);
+    filesystem_update_mtime(current->p->fs, newparent);
     file_op_begin(current);
     filesystem_rename(current->p->fs, oldparent, lookup_sym(oldparent, old),
             newparent, filename_from_path(newpath),
@@ -1622,6 +1663,8 @@ sysreturn renameat2(int olddirfd, const char *oldpath, int newdirfd,
         if (ret) {
             return set_syscall_return(current, ret);
         }
+        filesystem_update_mtime(current->p->fs, oldparent);
+        filesystem_update_mtime(current->p->fs, newparent);
         file_op_begin(current);
         filesystem_exchange(current->p->fs, oldparent,
                 lookup_sym(oldparent, old), newparent,
@@ -1913,6 +1956,8 @@ void register_file_syscalls(struct syscall *map)
     register_syscall(map, creat, creat);
     register_syscall(map, chdir, chdir);
     register_syscall(map, fchdir, fchdir);
+    register_syscall(map, utime, utime);
+    register_syscall(map, utimes, utimes);
     register_syscall(map, newfstatat, newfstatat);
     register_syscall(map, sched_getaffinity, sched_getaffinity);
     register_syscall(map, sched_setaffinity, sched_setaffinity);
@@ -1927,6 +1972,8 @@ void register_file_syscalls(struct syscall *map)
     register_syscall(map, prctl, prctl);
     register_syscall(map, sysinfo, sysinfo);
     register_syscall(map, umask, umask);
+    register_syscall(map, statfs, statfs);
+    register_syscall(map, fstatfs, fstatfs);
 }
 
 #define SYSCALL_F_NOTRACE 0x1

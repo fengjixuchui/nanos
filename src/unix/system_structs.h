@@ -118,6 +118,7 @@ typedef struct iovec {
 #define O_NONBLOCK	00004000
 #define O_DIRECT        00040000
 #define O_NOFOLLOW      00400000
+#define O_NOATIME       01000000
 #define O_CLOEXEC       02000000
 #define O_PATH         010000000
 
@@ -233,6 +234,11 @@ struct itimerspec {
 struct itimerval {
     struct timeval it_interval;
     struct timeval it_value;
+};
+
+struct utimbuf {
+    time_t actime;   /* access time */
+    time_t modtime;  /* modification time */
 };
 
 // straight from linux
@@ -732,6 +738,23 @@ struct epoll_event {
 #define EPOLLET		(1u << 31)
 
 typedef struct aux {u64 tag; u64 val;} *aux;
+
+struct statfs {
+    long f_type;
+    long f_bsize;
+    long f_blocks;
+    long f_bfree;
+    long f_bavail;
+    long f_files;
+    long f_ffree;
+    struct {
+        int val[2];
+    } f_fsid;
+    long f_namelen;
+    long f_frsize;
+    long f_flags;
+    long f_spare[4];
+};
 
 typedef u32 uid_t;
 typedef u32 gid_t;
