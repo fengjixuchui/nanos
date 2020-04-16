@@ -1,9 +1,11 @@
 # these are built for the target platform (Linux x86_64)
 PROGRAMS= \
+	aio \
 	dup \
 	creat \
 	epoll \
 	eventfd \
+	fallocate \
 	fcntl \
 	fst \
 	ftrace \
@@ -25,6 +27,7 @@ PROGRAMS= \
 	thread_test \
 	time \
 	udploop \
+	unixsocket \
 	unlink \
 	vsyscall \
 	web \
@@ -32,6 +35,11 @@ PROGRAMS= \
 	webs \
 	write \
 	writev
+
+SRCS-aio= \
+	$(CURDIR)/aio.c \
+	$(SRCDIR)/unix_process/ssp.c
+LDFLAGS-aio=	-static
 
 SRCS-dup= \
 	$(CURDIR)/dup.c \
@@ -54,6 +62,12 @@ SRCS-eventfd= \
 
 LDFLAGS-eventfd=	-static
 LIBS-eventfd=		-lpthread
+
+SRCS-fallocate= \
+	$(CURDIR)/fallocate.c \
+	$(SRCDIR)/unix_process/ssp.c
+
+LDFLAGS-fallocate=	-static
 
 SRCS-fcntl= \
 	$(CURDIR)/fcntl.c \
@@ -212,6 +226,12 @@ SRCS-udploop= \
 	$(SRCDIR)/runtime/tuple.c \
 	$(SRCDIR)/runtime/crypto/chacha.c
 LDFLAGS-udploop=	 -static
+
+SRCS-unixsocket= \
+	$(CURDIR)/unixsocket.c \
+	$(SRCDIR)/unix_process/ssp.c
+LDFLAGS-unixsocket=	-static
+LIBS-unixsocket=	-lpthread
 
 SRCS-unlink= \
 	$(CURDIR)/unlink.c \

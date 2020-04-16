@@ -123,10 +123,6 @@ void register_other_syscalls(struct syscall *map)
     register_syscall(map, lremovexattr, 0);
     register_syscall(map, fremovexattr, 0);
     register_syscall(map, set_thread_area, 0);
-    register_syscall(map, io_setup, 0);
-    register_syscall(map, io_destroy, 0);
-    register_syscall(map, io_getevents, 0);
-    register_syscall(map, io_submit, 0);
     register_syscall(map, io_cancel, 0);
     register_syscall(map, get_thread_area, 0);
     register_syscall(map, lookup_dcookie, 0);
@@ -173,7 +169,6 @@ void register_other_syscalls(struct syscall *map)
     register_syscall(map, vmsplice, 0);
     register_syscall(map, move_pages, 0);
     register_syscall(map, utimensat, 0);
-    register_syscall(map, fallocate, 0);
     register_syscall(map, inotify_init1, 0);
     register_syscall(map, preadv, 0);
     register_syscall(map, pwritev, 0);
@@ -678,6 +673,8 @@ static int file_type_from_tuple(tuple n)
         return FDESC_TYPE_SYMLINK;
     else if (is_special(n))
         return FDESC_TYPE_SPECIAL;
+    else if (is_socket(n))
+        return FDESC_TYPE_SOCKET;
     else
         return FDESC_TYPE_REGULAR;
 }
@@ -688,6 +685,8 @@ static int dt_from_tuple(tuple n)
         return DT_DIR;
     else if (is_symlink(n))
         return DT_LNK;
+    else if (is_socket(n))
+        return DT_SOCK;
     else
         return DT_REG;
 }
@@ -1458,18 +1457,6 @@ static sysreturn readlink_internal(tuple cwd, const char *pathname, char *buf,
 sysreturn readlink(const char *pathname, char *buf, u64 bufsiz)
 {
     thread_log(current, "readlink: \"%s\"", pathname);
-
-    // special case for /proc/self/exe for $ORIGIN handling in ld-linux.so(8)
-    if (runtime_strcmp(pathname, "/proc/self/exe") == 0) {
-        value p = table_find(current->p->process_root, sym(program));
-        assert(p != 0);
-        sysreturn retval = MIN(bufsiz, buffer_length(p));
-        // readlink(2) does not NUL-terminate
-        runtime_memcpy(buf, buffer_ref(p, 0), retval);
-        thread_log(current, "readlink: returning \"%v\"", alloca_wrap_buffer(buf, retval));
-        return retval;
-    }
-
     return readlink_internal(current->p->cwd, pathname, buf, bufsiz);
 }
 
@@ -1925,6 +1912,7 @@ void register_file_syscalls(struct syscall *map)
     register_syscall(map, dup2, dup2);
     register_syscall(map, dup3, dup3);
     register_syscall(map, fstat, fstat);
+    register_syscall(map, fallocate, fallocate);
     register_syscall(map, sendfile, sendfile);
     register_syscall(map, stat, stat);
     register_syscall(map, lstat, lstat);
@@ -1934,6 +1922,10 @@ void register_file_syscalls(struct syscall *map)
     register_syscall(map, ftruncate, ftruncate);
     register_syscall(map, fdatasync, fdatasync);
     register_syscall(map, fsync, fsync);
+    register_syscall(map, io_setup, io_setup);
+    register_syscall(map, io_submit, io_submit);
+    register_syscall(map, io_getevents, io_getevents);
+    register_syscall(map, io_destroy, io_destroy);
     register_syscall(map, access, access);
     register_syscall(map, lseek, lseek);
     register_syscall(map, fcntl, fcntl);

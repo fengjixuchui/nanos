@@ -92,6 +92,7 @@ typedef struct iovec {
 #define EMLINK          31              /* Too many links */
 #define EPIPE           32              /* Broken pipe */
 #define ERANGE          34              /* Math result not representable */
+#define ENAMETOOLONG    36              /* File name too long */
 
 #define ENOSYS          38              /* Invalid system call number */
 #define ENOTEMPTY       39              /* Directory not empty */
@@ -99,6 +100,7 @@ typedef struct iovec {
 #define ENOPROTOOPT     42              /* Protocol not available */
 
 #define EDESTADDRREQ    89		/* Destination address required */
+#define EMSGSIZE        90		/* Message too long */
 #define EOPNOTSUPP      95		/* Operation not supported */
 #define EISCONN         106
 #define ENOTCONN        107
@@ -759,6 +761,36 @@ struct statfs {
 typedef u32 uid_t;
 typedef u32 gid_t;
 
+enum {
+    IOCB_CMD_PREAD = 0,
+    IOCB_CMD_PWRITE = 1,
+};
+
+#define IOCB_FLAG_RESFD (1 << 0)
+
+struct iocb {
+    u64 aio_data;
+    u32 aio_key;
+    u32 aio_reserved1;
+    u16 aio_lio_opcode;
+    s16 aio_reqprio;
+    u32 aio_fildes;
+    u64 aio_buf;
+    u64 aio_nbytes;
+    s64 aio_offset;
+    u64 aio_reserved2;
+    u32 aio_flags;
+    u32 aio_resfd;
+};
+
+struct io_event {
+    u64 data;
+    u64 obj;
+    s64 res;
+    s64 res2;
+};
+
+typedef struct aio_ring *aio_context_t;
 
 /* set/getsockopt optnames */
 #define SO_DEBUG     1
@@ -786,3 +818,10 @@ typedef u32 gid_t;
 /* signalfd flags */
 #define SFD_NONBLOCK O_NONBLOCK
 #define SFD_CLOEXEC  O_CLOEXEC
+
+/* fallocate flags */
+#define FALLOC_FL_KEEP_SIZE         0x01
+#define FALLOC_FL_PUNCH_HOLE        0x02
+#define FALLOC_FL_COLLAPSE_RANGE    0x08
+#define FALLOC_FL_ZERO_RANGE        0x10
+#define FALLOC_FL_INSERT_RANGE      0x20

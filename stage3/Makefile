@@ -39,6 +39,7 @@ SRCS-stage3.img= \
 	$(SRCDIR)/runtime/crypto/chacha.c \
 	$(SRCDIR)/tfs/tfs.c \
 	$(SRCDIR)/tfs/tlog.c \
+	$(SRCDIR)/unix/aio.c \
 	$(SRCDIR)/unix/blockq.c \
 	$(SRCDIR)/unix/exec.c \
 	$(SRCDIR)/unix/eventfd.c \
@@ -49,7 +50,7 @@ SRCS-stage3.img= \
 	$(SRCDIR)/unix/notify.c \
 	$(SRCDIR)/unix/poll.c \
 	$(SRCDIR)/unix/signal.c \
-	$(SRCDIR)/unix/socketpair.c \
+	$(SRCDIR)/unix/socket.c \
 	$(SRCDIR)/unix/special.c \
 	$(SRCDIR)/unix/syscall.c \
 	$(SRCDIR)/unix/thread.c \

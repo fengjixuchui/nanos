@@ -303,6 +303,8 @@ typedef struct vmap {
     u64 flags;
 } *vmap;
 
+typedef closure_type(vmap_handler, void, vmap);
+
 vmap allocate_vmap(rangemap rm, range r, u64 flags);
 boolean adjust_process_heap(process p, range new);
 
@@ -342,6 +344,8 @@ typedef struct process {
     id_heap           posix_timer_ids;
     vector            posix_timers; /* unix_timer by timerid */
     vector            itimers;      /* unix_timer by ITIMER_ type */
+    id_heap           aio_ids;
+    vector            aio;
 } *process;
 
 typedef struct sigaction *sigaction;
@@ -406,6 +410,12 @@ static inline void release_fdesc(fdesc f)
 static inline int fdesc_type(fdesc f)
 {
     return f->type;
+}
+
+static inline void fdesc_notify_events(fdesc f)
+{
+    u32 events = apply(f->events, 0);
+    notify_dispatch(f->ns, events);
 }
 
 u64 allocate_fd(process p, void *f);
@@ -521,6 +531,7 @@ boolean unix_timers_init(unix_heaps uh);
 extern sysreturn syscall_ignore();
 boolean do_demand_page(u64 vaddr, vmap vm);
 vmap vmap_from_vaddr(process p, u64 vaddr);
+void vmap_iterator(process p, vmap_handler vmh);
 
 void thread_log_internal(thread t, const char *desc, ...);
 #define thread_log(__t, __desc, ...) thread_log_internal(__t, __desc, ##__VA_ARGS__)
@@ -607,6 +618,12 @@ static inline boolean futex_wake_one_by_uaddr(process p, int *uaddr)
 {
     return futex_wake_many_by_uaddr(p, uaddr, 1);
 }
+
+sysreturn io_setup(unsigned int nr_events, aio_context_t *ctx_idp);
+sysreturn io_submit(aio_context_t ctx_id, long nr, struct iocb **iocbpp);
+sysreturn io_getevents(aio_context_t ctx_id, long min_nr, long nr,
+        struct io_event *events, struct timespec *timeout);
+sysreturn io_destroy(aio_context_t ctx_id);
 
 int do_pipe2(int fds[2], int flags);
 
