@@ -66,6 +66,8 @@ SRCS-stage3.img= \
 	$(SRCDIR)/virtio/virtio_scsi.c \
 	$(SRCDIR)/virtio/virtqueue.c \
 	$(SRCDIR)/virtio/scsi.c \
+	$(SRCDIR)/vmware/vmxnet3_net.c \
+	$(SRCDIR)/vmware/vmxnet3_queue.c \
 	$(SRCDIR)/xen/xen.c \
 	$(SRCDIR)/xen/xennet.c \
 	$(SRCDIR)/x86_64/ap.s \
@@ -132,7 +134,7 @@ INCLUDES=\
 	-I$(SRCDIR)/xen/public \
 	-I$(LWIPDIR)/src/include
 
-CFLAGS+=$(KERNCFLAGS) -DSTAGE3
+CFLAGS+=$(KERNCFLAGS) -DSTAGE3 -mcmodel=kernel
 CFLAGS+=$(INCLUDES)
 
 # Enable tracing by specifying TRACE=ftrace on command line

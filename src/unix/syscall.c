@@ -75,10 +75,10 @@ void register_other_syscalls(struct syscall *map)
     register_syscall(map, sched_get_priority_max, 0);
     register_syscall(map, sched_get_priority_min, 0);
     register_syscall(map, sched_rr_get_interval, 0);
-    register_syscall(map, mlock, 0);
-    register_syscall(map, munlock, 0);
-    register_syscall(map, mlockall, 0);
-    register_syscall(map, munlockall, 0);
+    register_syscall(map, mlock, syscall_ignore);
+    register_syscall(map, munlock, syscall_ignore);
+    register_syscall(map, mlockall, syscall_ignore);
+    register_syscall(map, munlockall, syscall_ignore);
     register_syscall(map, vhangup, 0);
     register_syscall(map, modify_ldt, 0);
     register_syscall(map, pivot_root, 0);
@@ -195,7 +195,7 @@ void register_other_syscalls(struct syscall *map)
     register_syscall(map, execveat, 0);
     register_syscall(map, userfaultfd, 0);
     register_syscall(map, membarrier, 0);
-    register_syscall(map, mlock2, 0);
+    register_syscall(map, mlock2, syscall_ignore);
     register_syscall(map, copy_file_range, 0);
     register_syscall(map, preadv2, 0);
     register_syscall(map, pwritev2, 0);
@@ -498,6 +498,7 @@ closure_function(9, 2, void, sendfile_bh,
                 thread_log(t, "   rewound %ld bytes to %ld", rewind, f_in->offset);
             }
             rv = bound(written) == 0 ? -EAGAIN : bound(written);
+            sg_buf_release(bound(cur_buf));
             thread_log(t, "   write would block, returning %ld", rv);
         } else {
             thread_log(t, "   zero or error, rv %ld", rv);
@@ -523,7 +524,6 @@ closure_function(9, 2, void, sendfile_bh,
     } else {
         bound(written) += rv;
         bound(cur_buf)->misc += rv;
-        assert(bound(cur_buf)->length >= rv);
         if (bound(cur_buf)->misc == bound(cur_buf)->length) {
             sg_buf_release(bound(cur_buf));
             if (bound(written) == bound(readlen)) {
@@ -534,6 +534,7 @@ closure_function(9, 2, void, sendfile_bh,
             assert(bound(cur_buf) != INVALID_ADDRESS);
             bound(cur_buf)->misc = 0; /* offset for our use */
         }
+        assert(bound(cur_buf)->misc < bound(cur_buf)->length);
     }
 
     /* issue next write */
@@ -715,8 +716,10 @@ closure_function(2, 0, sysreturn, file_close,
         ret = spec_close(f);
     }
         
-    if (ret == 0)
+    if (ret == 0) {
+        release_fdesc(&f->f);
         unix_cache_free(get_unix_heaps(), file, f);
+    }
     return 0;
 }
 
@@ -1142,19 +1145,25 @@ sysreturn fchdir(int dirfd)
     return set_syscall_return(current, 0);
 }
 
-closure_function(1, 1, void, truncate_complete,
-                 thread, t,
+closure_function(3, 1, void, truncate_complete,
+                 thread, t, file, f, fsfile, fsf,
                  status, s)
 {
     thread t = bound(t);
     thread_log(current, "%s: status %v (%s)", __func__, s,
             is_ok(s) ? "OK" : "NOTOK");
+    if (is_ok(s)) {
+        file f = bound(f);
+        if (f) {
+            f->length = fsfile_get_length(bound(fsf));
+        }
+    }
     set_syscall_return(t, is_ok(s) ? 0 : -EIO);
     file_op_maybe_wake(t);
     closure_finish();
 }
 
-static sysreturn truncate_internal(tuple t, long length)
+static sysreturn truncate_internal(file f, tuple t, long length)
 {
     if (is_dir(t)) {
         return set_syscall_error(current, EISDIR);
@@ -1169,7 +1178,7 @@ static sysreturn truncate_internal(tuple t, long length)
     file_op_begin(current);
     if (filesystem_truncate(current->p->fs, fsf, length,
             closure(heap_general(get_kernel_heaps()), truncate_complete,
-            current))) {
+            current, f, fsf))) {
         /* Nothing to do. */
         return 0;
     }
@@ -1185,7 +1194,7 @@ sysreturn truncate(const char *path, long length)
     if (ret) {
         return set_syscall_return(current, ret);
     }
-    return truncate_internal(t, length);
+    return truncate_internal(0, t, length);
 }
 
 sysreturn ftruncate(int fd, long length)
@@ -1196,7 +1205,7 @@ sysreturn ftruncate(int fd, long length)
             (f->f.type != FDESC_TYPE_REGULAR)) {
         return set_syscall_error(current, EINVAL);
     }
-    return truncate_internal(f->n, length);
+    return truncate_internal(f, f->n, length);
 }
 
 closure_function(2, 1, void, fsync_complete,
@@ -1437,12 +1446,18 @@ sysreturn getrlimit(int resource, struct rlimit *rlim)
         rlim->rlim_cur = 2*1024*1024;
         rlim->rlim_max = 2*1024*1024;
         return 0;
+    case RLIMIT_CORE:
+        rlim->rlim_cur = rlim->rlim_max = 0;    // core dump not supported
+        return 0;
     case RLIMIT_NOFILE:
         if (!rlim)
             return set_syscall_error(current, EINVAL);
         // we .. .dont really have one?
         rlim->rlim_cur = 65536;
         rlim->rlim_max = 65536;
+        return 0;
+    case RLIMIT_AS:
+        rlim->rlim_cur = rlim->rlim_max = heap_total(&current->p->virtual->h);
         return 0;
     }
 
@@ -1495,7 +1510,7 @@ static sysreturn brk(void *x)
             if (phys == INVALID_PHYSICAL)
                 goto fail;
             /* XXX no exec configurable? */
-            map(u64_from_pointer(p->brk), phys, alloc, PAGE_WRITABLE | PAGE_NO_EXEC | PAGE_USER , heap_pages(kh));
+            map(u64_from_pointer(p->brk), phys, alloc, PAGE_WRITABLE | PAGE_NO_EXEC | PAGE_USER);
             // people shouldn't depend on this
             zero(p->brk, alloc);
             p->brk += alloc;         

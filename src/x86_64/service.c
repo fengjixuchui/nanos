@@ -1,3 +1,5 @@
+/* TODO: this file has become a garbage dump ... reorganize */
+
 #include <kernel.h>
 #include <pci.h>
 #include <tfs.h>
@@ -7,6 +9,7 @@
 #include <page.h>
 #include <symtab.h>
 #include <virtio/virtio.h>
+#include <vmware/vmxnet3.h>
 #include <drivers/storage.h>
 #include <drivers/console.h>
 #include <kvm_platform.h>
@@ -16,6 +19,7 @@
 //#define SMP_DUMP_FRAME_RETURN_COUNT
 
 //#define STAGE3_INIT_DEBUG
+//#define MM_DEBUG
 #ifdef STAGE3_INIT_DEBUG
 #define init_debug(x, ...) do {rprintf("INIT: " x "\n", ##__VA_ARGS__);} while(0)
 #else
@@ -31,11 +35,12 @@ static heap allocate_tagged_region(kernel_heaps kh, u64 tag)
 {
     heap h = heap_general(kh);
     heap p = (heap)heap_physical(kh);
-    u64 tag_base = tag << va_tag_offset;
-    u64 tag_length = U64_FROM_BIT(va_tag_offset);
+    assert(tag < U64_FROM_BIT(VA_TAG_WIDTH));
+    u64 tag_base = KMEM_BASE | (tag << VA_TAG_OFFSET);
+    u64 tag_length = U64_FROM_BIT(VA_TAG_OFFSET);
     heap v = (heap)create_id_heap(h, heap_backed(kh), tag_base, tag_length, p->pagesize);
     assert(v != INVALID_ADDRESS);
-    heap backed = physically_backed(h, v, p, heap_pages(kh), p->pagesize);
+    heap backed = physically_backed(h, v, p, p->pagesize);
     if (backed == INVALID_ADDRESS)
         return backed;
 
@@ -103,6 +108,33 @@ closure_function(1, 2, void, fsstarted,
     closure_finish();
 }
 
+/* will become list I guess */
+static pagecache global_pagecache;
+
+/* This is very simplistic and uses a fixed drain threshold. This
+   should also take all cached data in system into account. For now we
+   just pick on the single pagecache... */
+
+#ifdef MM_DEBUG
+#define mm_debug(x, ...) do {rprintf("MM:   " x, ##__VA_ARGS__);} while(0)
+#else
+#define mm_debug(x, ...) do { } while(0)
+#endif
+void mm_service(void)
+{
+    if (!global_pagecache)
+        return;
+    heap p = (heap)heap_physical(&heaps);
+    u64 free = heap_total(p) - heap_allocated(p);
+    mm_debug("%s: total %ld, alloc %ld, free %ld\n", __func__, heap_total(p), heap_allocated(p), free);
+    if (free < CACHE_DRAIN_CUTOFF) {
+        u64 drain_bytes = CACHE_DRAIN_CUTOFF - free;
+        u64 drained = pagecache_drain(global_pagecache, drain_bytes);
+        if (drained > 0)
+            mm_debug("   drained %ld / %ld requested...\n", drained, drain_bytes);
+    }
+}
+
 closure_function(2, 3, void, attach_storage,
                  tuple, root, u64, fs_offset,
                  block_io, r, block_io, w, u64, length)
@@ -117,6 +149,9 @@ closure_function(2, 3, void, attach_storage,
                                       closure(h, offset_block_io, bound(fs_offset), w));
     if (pc == INVALID_ADDRESS)
         halt("unable to create pagecache\n");
+
+    /* figure that later pagecaches will register themselves with backing - glue for now */
+    global_pagecache = pc;
     create_filesystem(h,
                       SECTOR_SIZE,
                       SECTOR_SIZE,
@@ -142,13 +177,13 @@ static void read_kernel_syms()
 	    kern_length = e->length;
 
 	    u64 v = allocate_u64((heap)heap_virtual_huge(&heaps), kern_length);
-	    map(v, kern_base, kern_length, 0, heap_pages(&heaps));
+	    map(v, kern_base, kern_length, 0);
 #ifdef ELF_SYMTAB_DEBUG
 	    rprintf("kernel ELF image at 0x%lx, length %ld, mapped at 0x%lx\n",
 		    kern_base, kern_length, v);
 #endif
 	    add_elf_syms(alloca_wrap_buffer(v, kern_length));
-            unmap(v, kern_length, heap_pages(&heaps));
+            unmap(v, kern_length);
 	    break;
 	}
     }
@@ -202,7 +237,7 @@ static void reclaim_regions(void)
 {
     for_regions(e) {
         if (e->type == REGION_RECLAIM) {
-            unmap(e->base, e->length, heap_pages(&heaps));
+            unmap(e->base, e->length);
             if (!id_heap_add_range(heap_physical(&heaps), e->base, e->length))
                 halt("%s: add range for physical heap failed (%R)\n",
                      __func__, irange(e->base, e->base + e->length));
@@ -236,7 +271,7 @@ struct cpuinfo cpuinfos[MAX_CPUS];
 static void init_cpuinfos(kernel_heaps kh)
 {
     heap h = heap_general(kh);
-    heap pages = heap_pages(kh);
+    heap backed = heap_backed(kh);
 
     /* We're stuck with a hard limit of 64 for now due to bitmask... */
     build_assert(MAX_CPUS <= 64);
@@ -255,9 +290,9 @@ static void init_cpuinfos(kernel_heaps kh)
         ci->frcount = 0;
         /* frame and stacks */
         ci->kernel_frame = allocate_frame(h);
-        ci->kernel_stack = allocate_stack(pages, KERNEL_STACK_PAGES);
-        ci->fault_stack = allocate_stack(pages, FAULT_STACK_PAGES);
-        ci->int_stack = allocate_stack(pages, INT_STACK_PAGES);
+        ci->kernel_stack = allocate_stack(backed, KERNEL_STACK_SIZE);
+        ci->fault_stack = allocate_stack(backed, FAULT_STACK_SIZE);
+        ci->int_stack = allocate_stack(backed, INT_STACK_SIZE);
         //        init_debug("cpu %2d: kernel_frame %p, kernel_stack %p", i, ci->kernel_frame, ci->kernel_stack);
         //        init_debug("        fault_stack  %p, int_stack    %p", ci->fault_stack, ci->int_stack);
     }
@@ -288,7 +323,6 @@ static void __attribute__((noinline)) init_service_new_stack()
 {
     kernel_heaps kh = &heaps;
     heap misc = heap_general(kh);
-    heap pages = heap_pages(kh);
 
     /* runtime and console init */
     init_debug("in init_service_new_stack");
@@ -297,7 +331,7 @@ static void __attribute__((noinline)) init_service_new_stack()
     init_tuples(allocate_tagged_region(kh, tag_tuple));
     init_symbols(allocate_tagged_region(kh, tag_symbol), misc);
     init_sg(misc);
-    unmap(0, PAGESIZE, pages);  /* unmap zero page */
+    unmap(0, PAGESIZE);         /* unmap zero page */
     reclaim_regions();          /* unmap and reclaim stage2 stack */
     init_extra_prints();
 #if 0 // XXX
@@ -373,6 +407,7 @@ static void __attribute__((noinline)) init_service_new_stack()
         init_debug("probing for virtio PV network...");
         /* qemu virtio */
         init_virtio_network(kh);
+        init_vmxnet3_network(kh);
     }
 
     init_debug("pci_discover (for virtio & ata)");
@@ -381,11 +416,11 @@ static void __attribute__((noinline)) init_service_new_stack()
     /* Switch to stage3 GDT64, enable TSS and free up initial map */
     init_debug("install GDT64 and TSS");
     install_gdt64_and_tss(0);
-    unmap(PAGESIZE, INITIAL_MAP_SIZE - PAGESIZE, pages);
+    unmap(PAGESIZE, INITIAL_MAP_SIZE - PAGESIZE);
 
 #ifdef SMP_ENABLE
     init_debug("starting APs");
-    start_cpu(misc, pages, TARGET_EXCLUSIVE_BROADCAST, new_cpu);
+    start_cpu(misc, heap_backed(kh), TARGET_EXCLUSIVE_BROADCAST, new_cpu);
     kernel_delay(milliseconds(200));   /* temp, til we check tables to know what we have */
     init_debug("total CPUs %d\n", total_processors);
 #endif
@@ -393,44 +428,16 @@ static void __attribute__((noinline)) init_service_new_stack()
     runloop();
 }
 
-static heap init_pages_id_heap(heap h)
+static range find_initial_pages(void)
 {
-    boolean found = false;
-    id_heap pages = allocate_id_heap(h, h, PAGESIZE);
     for_regions(e) {
-	if (e->type == REGION_IDENTITY) {
-            assert(!found);     /* should only be one... */
+	if (e->type == REGION_INITIAL_PAGES) {
 	    u64 base = e->base;
 	    u64 length = e->length;
-	    if ((base & (PAGESIZE-1)) | (length & (PAGESIZE-1))) {
-		console("identity region unaligned!\nbase: ");
-		print_u64(base);
-		console(", length: ");
-		print_u64(length);
-		halt("\nhalt");
-	    }
-
-#ifdef STAGE3_INIT_DEBUG
-	    console("INIT: pages heap: [");
-	    print_u64(base);
-	    console(", ");
-	    print_u64(base + length);
-	    console(")\n");
-#endif
-	    if (!id_heap_add_range(pages, base, length))
-		halt("    - id_heap_add_range failed\n");
-	    found = true;
-	} else if (e->type == REGION_IDENTITY_RESERVED) {
-            assert(heaps.identity_reserved_start == 0);     /* should only be one... */
-            heaps.identity_reserved_start = e->base;
-            heaps.identity_reserved_end = e->base + e->length;
+            return irange(base, base + length);
         }
     }
-    if (!found)
-        halt("no identity region found; halt\n");
-    if (heaps.identity_reserved_start == 0)
-        halt("reserved identity region not found; halt\n");
-    return (heap)pages;
+    halt("no initial pages region found; halt\n");
 }
 
 static id_heap init_physical_id_heap(heap h)
@@ -443,7 +450,7 @@ static id_heap init_physical_id_heap(heap h)
 	    /* Align for 2M pages */
 	    u64 base = e->base;
 	    u64 end = base + e->length - 1;
-	    u64 page2m_mask = (2 << 20) - 1;
+	    u64 page2m_mask = MASK(PAGELOG_2M);
 	    base = (base + page2m_mask) & ~page2m_mask;
 	    end &= ~page2m_mask;
 	    if (base >= end)
@@ -473,24 +480,17 @@ static void init_kernel_heaps()
     bootstrap.alloc = bootstrap_alloc;
     bootstrap.dealloc = leak;
 
-    heaps.pages = init_pages_id_heap(&bootstrap);
-
-    /* This returns a wrapped physical heap which takes an (irq-safe)
-       lock for each heap method. Not clear if this would be better as
-       some other (non-heap) interface.
-
-       XXX should we pass pages and forget needing it as a parameter?
-       why would it ever need to be a parameter as opposed to global? */
-    heaps.physical = init_page_tables(&bootstrap, init_physical_id_heap(&bootstrap));
-
-    heaps.virtual_huge = create_id_heap(&bootstrap, &bootstrap, HUGE_PAGESIZE,
-				      (1ull<<VIRTUAL_ADDRESS_BITS)- HUGE_PAGESIZE, HUGE_PAGESIZE);
+    heaps.virtual_huge = create_id_heap(&bootstrap, &bootstrap, KMEM_BASE,
+                                        KMEM_LIMIT - KMEM_BASE, HUGE_PAGESIZE);
     assert(heaps.virtual_huge != INVALID_ADDRESS);
 
     heaps.virtual_page = create_id_heap_backed(&bootstrap, &bootstrap, (heap)heaps.virtual_huge, PAGESIZE);
     assert(heaps.virtual_page != INVALID_ADDRESS);
 
-    heaps.backed = physically_backed(&bootstrap, (heap)heaps.virtual_page, (heap)heaps.physical, heaps.pages, PAGESIZE);
+    heaps.physical = init_page_tables(&bootstrap, init_physical_id_heap(&bootstrap), find_initial_pages());
+    assert(heaps.physical != INVALID_ADDRESS);
+
+    heaps.backed = physically_backed(&bootstrap, (heap)heaps.virtual_page, (heap)heaps.physical, PAGESIZE);
     assert(heaps.backed != INVALID_ADDRESS);
 
     heaps.general = allocate_mcache(&bootstrap, heaps.backed, 5, 20, PAGESIZE_2M);

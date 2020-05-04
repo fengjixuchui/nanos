@@ -27,8 +27,8 @@ static void build_exec_stack(process p, thread t, Elf64_Ehdr * e, void *start,
 {
     exec_debug("build_exec_stack start %p, tid %d, va 0x%lx\n", start, t->tid, va);
 
-    /* allocate process stack at top of lowmem */
-    u64 stack_start = p->lowmem_end - PROCESS_STACK_SIZE;
+    /* allocate process stack at top of first 2gb of address space */
+    u64 stack_start = 0x80000000 - PROCESS_STACK_SIZE;
     if (aslr)
         stack_start = (stack_start - PROCESS_STACK_ASLR_RANGE) + get_aslr_offset(PROCESS_STACK_ASLR_RANGE);
     assert(id_heap_set_area(p->virtual32, stack_start, PROCESS_STACK_SIZE, true, true));
@@ -40,8 +40,7 @@ static void build_exec_stack(process p, thread t, Elf64_Ehdr * e, void *start,
     assert(sphys != INVALID_PHYSICAL);
 
     exec_debug("stack allocated at %p, size 0x%lx, phys 0x%lx\n", s, PROCESS_STACK_SIZE, sphys);
-    map(u64_from_pointer(s), sphys, PROCESS_STACK_SIZE, PAGE_WRITABLE | PAGE_NO_EXEC | PAGE_USER,
-        heap_pages(get_kernel_heaps()));
+    map(u64_from_pointer(s), sphys, PROCESS_STACK_SIZE, PAGE_WRITABLE | PAGE_NO_EXEC | PAGE_USER);
 
     s += PROCESS_STACK_SIZE >> 3;
 
@@ -153,14 +152,17 @@ closure_function(2, 4, void, exec_elf_map,
     if (flags & PAGE_WRITABLE)
         vmflags |= VMAP_FLAG_WRITABLE;
 
-    assert(allocate_vmap(bound(p)->vmaps, irange(target, target + size), vmflags) != INVALID_ADDRESS);
+    range r = irange(target, target + size);
     boolean is_bss = paddr == INVALID_PHYSICAL;
+    exec_debug("%s: add to vmap: %R vmflags 0x%lx%s\n",
+               __func__, r, vmflags, is_bss ? "bss" : "");
+    assert(allocate_vmap(bound(p)->vmaps, r, vmflags) != INVALID_ADDRESS);
     if (is_bss) {
         /* bss */
         paddr = allocate_u64((heap)heap_physical(kh), size);
         assert(paddr != INVALID_PHYSICAL);
     }
-    map(target, paddr, size, flags | PAGE_USER, heap_pages(kh));
+    map(target, paddr, size, flags | PAGE_USER);
     if (is_bss) {
         zero(pointer_from_u64(target), size);
     }
@@ -251,6 +253,12 @@ process exec_elf(buffer ex, process kp)
 
     build_exec_stack(proc, t, e, entry, load_range.start, root, aslr);
 
+    if (table_find(proc->process_root, sym(ingest_program_symbols))) {
+        exec_debug("ingesting symbols...\n");
+        add_elf_syms(ex);
+        exec_debug("...done\n");
+    }
+
     if (interp) {
         exec_debug("reading interp...\n");
         filesystem_read_entire(fs, interp, heap_backed(kh),
@@ -261,7 +269,6 @@ process exec_elf(buffer ex, process kp)
 
     exec_debug("starting process...\n");
     start_process(t, entry);
-    add_elf_syms(ex);
     return proc;    
 }
 
