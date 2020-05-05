@@ -4,6 +4,7 @@
 #define KERNEL_BASE 0xffffffff80000000ull
 #define KMEM_LIMIT  0xffffffff00000000ull
 #define PAGES_BASE  0xffffffffc0000000ull
+#define USER_LIMIT  0x0000800000000000ull
 
 #ifdef BOOT
 
@@ -51,7 +52,7 @@ extern void * AP_BOOT_PAGE;
 
 #define STAGE2_STACK_SIZE  (128 * KB)  /* stage2 stack is recycled, too */
 #define KERNEL_STACK_SIZE  (128 * KB)
-#define FAULT_STACK_SIZE   (32 * KB)
+#define EXCEPT_STACK_SIZE  (32 * KB)
 #define INT_STACK_SIZE     (32 * KB)
 #define BH_STACK_SIZE      (32 * KB)
 #define SYSCALL_STACK_SIZE (32 * KB)

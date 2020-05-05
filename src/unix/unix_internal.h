@@ -432,6 +432,26 @@ void init_vdso(process p);
 
 void mmap_process_init(process p);
 
+/* This "validation" is just a simple limit check right now, but this
+   could optionally expand to do more rigorous validation (e.g. vmap
+   lookup or page table walk). We may also want to place attributes on
+   user pointer arguments for use with a static analysis tool like
+   Sparse. */
+
+static inline boolean validate_user_memory(const void *p, bytes length, boolean write)
+{
+    u64 v = u64_from_pointer(p);
+
+    /* no zero page access */
+    if (v < PAGESIZE)
+        return false;
+
+    if (length >= USER_LIMIT)
+        return false;
+
+    return v < USER_LIMIT - length;
+}
+
 static inline u64 get_aslr_offset(u64 range)
 {
     assert((range & (range - 1)) == 0);
@@ -629,6 +649,8 @@ sysreturn io_getevents(aio_context_t ctx_id, long min_nr, long nr,
 sysreturn io_destroy(aio_context_t ctx_id);
 
 int do_pipe2(int fds[2], int flags);
+int pipe_set_capacity(fdesc f, int capacity);
+int pipe_get_capacity(fdesc f);
 
 sysreturn socketpair(int domain, int type, int protocol, int sv[2]);
 
@@ -655,3 +677,5 @@ u32 spec_events(file f);
 
 void syscall_debug(context f);
 
+boolean validate_iovec(struct iovec *iov, u64 len, boolean write);
+boolean validate_user_string(const char *name);
