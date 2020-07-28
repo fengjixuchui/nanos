@@ -2,11 +2,13 @@
 
 #include <kernel.h>
 #include <pci.h>
+#include <pagecache.h>
 #include <tfs.h>
 #include <pagecache.h>
 #include <apic.h>
 #include <region.h>
 #include <page.h>
+#include <storage.h>
 #include <symtab.h>
 #include <virtio/virtio.h>
 #include <vmware/vmxnet3.h>
@@ -15,7 +17,13 @@
 #include <kvm_platform.h>
 #include <xen_platform.h>
 
-//#define SMP_ENABLE
+#define BOOT_PARAM_OFFSET_E820_ENTRIES  0x01E8
+#define BOOT_PARAM_OFFSET_BOOT_FLAG     0x01FE
+#define BOOT_PARAM_OFFSET_HEADER        0x0202
+#define BOOT_PARAM_OFFSET_CMD_LINE_PTR  0x0228
+#define BOOT_PARAM_OFFSET_CMDLINE_SIZE  0x0238
+#define BOOT_PARAM_OFFSET_E820_TABLE    0x02D0
+
 //#define SMP_DUMP_FRAME_RETURN_COUNT
 
 //#define STAGE3_INIT_DEBUG
@@ -30,6 +38,7 @@ extern void init_net(kernel_heaps kh);
 extern void init_interrupts(kernel_heaps kh);
 
 static struct kernel_heaps heaps;
+static filesystem root_fs;
 
 static heap allocate_tagged_region(kernel_heaps kh, u64 tag)
 {
@@ -96,20 +105,39 @@ closure_function(2, 3, void, offset_block_io,
 /* XXX some header reorg in order */
 void init_extra_prints(); 
 thunk create_init(kernel_heaps kh, tuple root, filesystem fs);
+filesystem_complete bootfs_handler(kernel_heaps kh, tuple root);
 
-closure_function(1, 2, void, fsstarted,
-                 tuple, root,
+/* will become list I guess */
+static pagecache global_pagecache;
+
+closure_function(5, 2, void, fsstarted,
+                 heap, h, u8 *, mbr, block_io, r, block_io, w, tuple, root,
                  filesystem, fs, status, s)
 {
     if (!is_ok(s))
         halt("unable to open filesystem: %v\n", s);
 
+    heap h = bound(h);
+    u8 *mbr = bound(mbr);
+    if (mbr) {
+        struct partition_entry *bootfs_part;
+        if (table_find(bound(root), sym(ingest_kernel_symbols)) &&
+                (bootfs_part = partition_get(mbr, PARTITION_BOOTFS))) {
+            init_debug("loading boot filesystem");
+            tuple bootfs_root = allocate_tuple();
+            create_filesystem(h, SECTOR_SIZE,
+                              bootfs_part->nsectors * SECTOR_SIZE,
+                              closure(h, offset_block_io,
+                              bootfs_part->lba_start * SECTOR_SIZE, bound(r)),
+                              0, global_pagecache, bootfs_root, false,
+                              bootfs_handler(&heaps, bootfs_root));
+        }
+        deallocate(h, mbr, SECTOR_SIZE);
+    }
+    root_fs = fs;
     enqueue(runqueue, create_init(&heaps, bound(root), fs));
     closure_finish();
 }
-
-/* will become list I guess */
-static pagecache global_pagecache;
 
 /* This is very simplistic and uses a fixed drain threshold. This
    should also take all cached data in system into account. For now we
@@ -127,26 +155,19 @@ void mm_service(void)
     heap p = (heap)heap_physical(&heaps);
     u64 free = heap_total(p) - heap_allocated(p);
     mm_debug("%s: total %ld, alloc %ld, free %ld\n", __func__, heap_total(p), heap_allocated(p), free);
-    if (free < CACHE_DRAIN_CUTOFF) {
-        u64 drain_bytes = CACHE_DRAIN_CUTOFF - free;
+    if (free < PAGECACHE_DRAIN_CUTOFF) {
+        u64 drain_bytes = PAGECACHE_DRAIN_CUTOFF - free;
         u64 drained = pagecache_drain(global_pagecache, drain_bytes);
         if (drained > 0)
             mm_debug("   drained %ld / %ld requested...\n", drained, drain_bytes);
     }
 }
 
-closure_function(2, 3, void, attach_storage,
-                 tuple, root, u64, fs_offset,
-                 block_io, r, block_io, w, u64, length)
+static void rootfs_init(heap h, u8 *mbr, tuple root, u64 offset,
+                        block_io r, block_io w, u64 length)
 {
-    // with filesystem...should be hidden as functional handlers on the tuplespace
-    heap h = heap_general(&heaps);
-    u64 offset = bound(fs_offset);
     length -= offset;
-    pagecache pc = allocate_pagecache(h, heap_backed(&heaps), length, PAGESIZE_2M, SECTOR_SIZE,
-                                      0 /* XXX mapper */,
-                                      closure(h, offset_block_io, bound(fs_offset), r),
-                                      closure(h, offset_block_io, bound(fs_offset), w));
+    pagecache pc = allocate_pagecache(h, h, (heap)heap_physical(&heaps), PAGESIZE);
     if (pc == INVALID_ADDRESS)
         halt("unable to create pagecache\n");
 
@@ -154,14 +175,47 @@ closure_function(2, 3, void, attach_storage,
     global_pagecache = pc;
     create_filesystem(h,
                       SECTOR_SIZE,
-                      SECTOR_SIZE,
                       length,
-                      heap_backed(&heaps),
-                      pagecache_reader_sg(pc),
-                      pagecache_writer(pc),
-                      bound(root),
+                      closure(h, offset_block_io, offset, r),
+                      closure(h, offset_block_io, offset, w),
+                      pc,
+                      root,
                       false,
-                      closure(h, fsstarted, bound(root)));
+                      closure(h, fsstarted, h, mbr, r, w, root));
+}
+
+closure_function(6, 1, void, mbr_read,
+                 heap, h, u8 *, mbr, tuple, root, block_io, r, block_io, w, u64, length,
+                 status, s)
+{
+    if (!is_ok(s))
+        halt("unable to read partitions: %v\n", s);
+    heap h = bound(h);
+    u8 *mbr = bound(mbr);
+    struct partition_entry *rootfs_part = partition_get(mbr, PARTITION_ROOTFS);
+    if (!rootfs_part)
+        halt("filesystem partition not found\n");
+    else
+        rootfs_init(h, mbr, bound(root), rootfs_part->lba_start * SECTOR_SIZE,
+            bound(r), bound(w), bound(length));
+    closure_finish();
+}
+
+closure_function(2, 3, void, attach_storage,
+                 tuple, root, u64, fs_offset,
+                 block_io, r, block_io, w, u64, length)
+{
+    heap h = heap_general(&heaps);
+    tuple root = bound(root);
+    u64 offset = bound(fs_offset);
+    if (offset == 0) {
+        /* Read partition table from disk */
+        u8 *mbr = allocate(h, SECTOR_SIZE);
+        assert(mbr != INVALID_ADDRESS);
+        apply(r, mbr, irange(0, SECTOR_SIZE),
+              closure(h, mbr_read, h, mbr, root, r, w, length));
+    } else
+        rootfs_init(h, 0, root, offset, r, w, length);
     closure_finish();
 }
 
@@ -186,10 +240,6 @@ static void read_kernel_syms()
             unmap(v, kern_length);
 	    break;
 	}
-    }
-    
-    if (kern_base == INVALID_PHYSICAL) {
-	console("kernel elf image region not found; no debugging symbols\n");
     }
 }
 
@@ -266,38 +316,23 @@ void vm_exit(u8 code)
     }
 }
 
-struct cpuinfo cpuinfos[MAX_CPUS];
-
-static void init_cpuinfos(kernel_heaps kh)
+closure_function(1, 1, void, sync_complete,
+                 u8, code,
+                 status, s)
 {
-    heap h = heap_general(kh);
-    heap backed = heap_backed(kh);
+    vm_exit(bound(code));
+}
 
-    /* We're stuck with a hard limit of 64 for now due to bitmask... */
-    build_assert(MAX_CPUS <= 64);
-
-    /* We'd like the aps to allocate for themselves, but we don't have
-       per-cpu heaps just yet. */
-    for (int i = 0; i < MAX_CPUS; i++) {
-        cpuinfo ci = cpuinfo_from_id(i);
-        ci->self = ci;
-
-        /* state */
-        ci->running_frame = 0;
-        ci->id = i;
-        ci->state = cpu_not_present;
-        ci->have_kernel_lock = false;
-        ci->frcount = 0;
-        /* frame and stacks */
-        ci->kernel_frame = allocate_frame(h);
-        ci->kernel_stack = allocate_stack(backed, KERNEL_STACK_SIZE);
-        ci->exception_stack = allocate_stack(backed, EXCEPT_STACK_SIZE);
-        ci->int_stack = allocate_stack(backed, INT_STACK_SIZE);
-        //        init_debug("cpu %2d: kernel_frame %p, kernel_stack %p", i, ci->kernel_frame, ci->kernel_stack);
-        //        init_debug("        fault_stack  %p, int_stack    %p", ci->fault_stack, ci->int_stack);
+extern boolean shutting_down;
+void kernel_shutdown(int status)
+{
+    shutting_down = true;
+    apic_ipi(TARGET_EXCLUSIVE_BROADCAST, 0, shutdown_vector);
+    if (global_pagecache) {
+        filesystem_flush(root_fs, closure(heap_general(&heaps), sync_complete, status));
+        runloop();
     }
-
-    cpu_setgs(0);
+    vm_exit(status);
 }
 
 u64 total_processors = 1;
@@ -323,6 +358,7 @@ static void __attribute__((noinline)) init_service_new_stack()
 {
     kernel_heaps kh = &heaps;
     heap misc = heap_general(kh);
+    heap backed = heap_backed(kh);
 
     /* runtime and console init */
     init_debug("in init_service_new_stack");
@@ -345,9 +381,7 @@ static void __attribute__((noinline)) init_service_new_stack()
     read_kernel_syms();
     init_debug("pci_discover (for VGA)");
     pci_discover(); // early PCI discover to configure VGA console
-    init_debug("init_cpuinfos");
-    init_cpuinfos(kh);
-    current_cpu()->state = cpu_kernel;
+    init_kernel_contexts(backed);
 
     /* interrupts */
     init_debug("init_interrupts");
@@ -387,13 +421,13 @@ static void __attribute__((noinline)) init_service_new_stack()
 
     init_debug("probe fs, register storage drivers");
     root = allocate_tuple();
-    u64 fs_offset = 0;
-    for_regions(e) {
-        if (e->type == REGION_FILESYSTEM)
-            fs_offset = SECTOR_SIZE + e->length;
-    }
-    if (fs_offset == 0)
-        halt("filesystem region not found; halt\n");
+    struct partition_entry *rootfs_part = partition_get(MBR_ADDRESS,
+        PARTITION_ROOTFS);
+    u64 fs_offset;
+    if (!rootfs_part)
+        fs_offset = 0;
+    else
+        fs_offset = rootfs_part->lba_start * SECTOR_SIZE;
     init_storage(kh, closure(misc, attach_storage, root, fs_offset));
 
     /* Probe for PV devices */
@@ -497,11 +531,130 @@ static void init_kernel_heaps()
     assert(heaps.general != INVALID_ADDRESS);
 }
 
-// init linker set
-void init_service()
+static void jump_to_virtual(u64 kernel_size, u64 *pdpt, u64 *pdt) {
+    /* Set up a temporary mapping of kernel code virtual address space, to be
+     * able to run from virtual addresses (which is needed to properly access
+     * things such as literal strings, static variables and function pointers).
+     */
+    assert(pdpt);
+    assert(pdt);
+    map_setup_2mbpages(KERNEL_BASE, KERNEL_BASE_PHYS,
+                       pad(kernel_size, PAGESIZE_2M) >> PAGELOG_2M,
+                       PAGE_WRITABLE, pdpt, pdt);
+
+    /* Jump to virtual address */
+    asm("movq $1f, %rdi \n\
+        jmp *%rdi \n\
+        1: \n");
+}
+
+static void cmdline_parse(const char *cmdline)
 {
+    init_debug("parsing cmdline");
+    const char *opt_end, *prefix_end;
+    while (*cmdline) {
+        opt_end = runtime_strchr(cmdline, ' ');
+        if (!opt_end)
+            opt_end = cmdline + runtime_strlen(cmdline);
+        prefix_end = runtime_strchr(cmdline, '.');
+        if (prefix_end && (prefix_end < opt_end)) {
+            int prefix_len = prefix_end - cmdline;
+            if ((prefix_len == sizeof("virtio_mmio") - 1) &&
+                    !runtime_memcmp(cmdline, "virtio_mmio", prefix_len))
+                virtio_mmio_parse(&heaps, prefix_end + 1,
+                    opt_end - (prefix_end + 1));
+        }
+        cmdline = opt_end + 1;
+    }
+}
+
+// init linker set
+void init_service(u64 rdi, u64 rsi)
+{
+    u8 *params = pointer_from_u64(rsi);
+    const char *cmdline = 0;
+    u32 cmdline_size;
+    if (params && (*(u16 *)(params + BOOT_PARAM_OFFSET_BOOT_FLAG) == 0xAA55) &&
+            (*(u32 *)(params + BOOT_PARAM_OFFSET_HEADER) == 0x53726448)) {
+        /* The kernel has been loaded directly by the hypervisor, without going
+         * through stage1 and stage2. */
+        u8 e820_entries = *(params + BOOT_PARAM_OFFSET_E820_ENTRIES);
+        region e820_r = (region)(params + BOOT_PARAM_OFFSET_E820_TABLE);
+        extern u8 END;
+        u64 kernel_size = u64_from_pointer(&END - KERNEL_BASE);
+        u64 *pdpt = 0;
+        u64 *pdt = 0;
+        for (u8 entry = 0; entry < e820_entries; entry++) {
+            region r = &e820_r[entry];
+            if (r->base == 0)
+                continue;
+            if ((r->type = REGION_PHYSICAL) && (r->base <= KERNEL_BASE_PHYS) &&
+                    (r->base + r->length > KERNEL_BASE_PHYS)) {
+                /* This is the memory region where the kernel has been loaded:
+                 * adjust the region boundaries so that the memory occupied by
+                 * the kernel code does not appear as free memory. */
+                u64 new_base = pad(KERNEL_BASE_PHYS + kernel_size, PAGESIZE);
+
+                /* Check that there is a gap between start of memory region and
+                 * start of kernel code, then use part of this gap as storage
+                 * for a set of temporary page tables that we need to set up an
+                 * initial mapping of the kernel virtual address space, and make
+                 * the remainder a new memory region. */
+                assert(KERNEL_BASE_PHYS - r->base >= 2 * PAGESIZE);
+                pdpt = pointer_from_u64(r->base);
+                pdt = pointer_from_u64(r->base + PAGESIZE);
+                create_region(r->base + 2 * PAGESIZE,
+                              KERNEL_BASE_PHYS - (r->base + 2 * PAGESIZE),
+                              r->type);
+
+                r->length -= new_base - r->base;
+                r->base = new_base;
+            }
+            create_region(r->base, r->length, r->type);
+        }
+        jump_to_virtual(kernel_size, pdpt, pdt);
+
+        cmdline = pointer_from_u64((u64)*((u32 *)(params +
+                BOOT_PARAM_OFFSET_CMD_LINE_PTR)));
+        cmdline_size = *((u32 *)(params + BOOT_PARAM_OFFSET_CMDLINE_SIZE));
+        if (u64_from_pointer(cmdline) + cmdline_size >= INITIAL_MAP_SIZE) {
+            /* Command line is outside the memory space we are going to map:
+             * move it at the beginning of the boot parameters (it's OK to
+             * overwrite the boot params, since we already parsed what we need).
+             */
+            assert(u64_from_pointer(params) + cmdline_size < MBR_ADDRESS);
+            runtime_memcpy(params, cmdline, cmdline_size);
+            params[cmdline_size] = '\0';
+            cmdline = (char *)params;
+        }
+
+        /* Set up initial mappings in the same way as stage2 does. */
+        struct region_heap rh;
+        region_heap_init(&rh, PAGESIZE, REGION_PHYSICAL);
+        u64 initial_pages_base = allocate_u64(&rh.h, INITIAL_PAGES_SIZE);
+        assert(initial_pages_base != INVALID_PHYSICAL);
+        region initial_pages_region = create_region(initial_pages_base,
+            INITIAL_PAGES_SIZE, REGION_INITIAL_PAGES);
+        heap pageheap = region_allocator(&rh.h, PAGESIZE, REGION_INITIAL_PAGES);
+        void *pgdir = bootstrap_page_tables(pageheap);
+        map(0, 0, INITIAL_MAP_SIZE, PAGE_WRITABLE);
+        map(PAGES_BASE, initial_pages_base, INITIAL_PAGES_SIZE, PAGE_WRITABLE);
+        map(KERNEL_BASE, KERNEL_BASE_PHYS, pad(kernel_size, PAGESIZE), 0);
+        initial_pages_region->length = INITIAL_PAGES_SIZE;
+        mov_to_cr("cr3", pgdir);
+    }
+    u64 cr;
+    mov_from_cr("cr0", cr);
+    cr |= C0_MP;
+    cr &= ~C0_EM;
+    mov_to_cr("cr0", cr);
+    mov_from_cr("cr4", cr);
+    cr |= CR4_OSFXSR | CR4_OSXMMEXCPT | CR4_OSXSAVE;
+    mov_to_cr("cr4", cr);
     init_debug("init_service");
     init_kernel_heaps();
+    if (cmdline)
+        cmdline_parse(cmdline);
     u64 stack_size = 32*PAGESIZE;
     u64 stack_location = allocate_u64(heap_backed(&heaps), stack_size);
     stack_location += stack_size - STACK_ALIGNMENT;

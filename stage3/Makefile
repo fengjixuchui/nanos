@@ -47,6 +47,7 @@ SRCS-stage3.img= \
 	$(SRCDIR)/unix/eventfd.c \
 	$(SRCDIR)/unix/filesystem.c \
 	$(SRCDIR)/unix/futex.c \
+	$(SRCDIR)/unix/io_uring.c \
 	$(SRCDIR)/unix/mktime.c \
 	$(SRCDIR)/unix/mmap.c \
 	$(SRCDIR)/unix/notify.c \
@@ -61,6 +62,8 @@ SRCS-stage3.img= \
 	$(SRCDIR)/unix/unix.c \
 	$(SRCDIR)/unix/vdso.c \
 	$(SRCDIR)/unix/pipe.c \
+	$(SRCDIR)/virtio/virtio.c \
+	$(SRCDIR)/virtio/virtio_mmio.c \
 	$(SRCDIR)/virtio/virtio_net.c \
 	$(SRCDIR)/virtio/virtio_pci.c \
 	$(SRCDIR)/virtio/virtio_storage.c \
@@ -69,6 +72,7 @@ SRCS-stage3.img= \
 	$(SRCDIR)/virtio/scsi.c \
 	$(SRCDIR)/vmware/vmxnet3_net.c \
 	$(SRCDIR)/vmware/vmxnet3_queue.c \
+	$(SRCDIR)/vmware/pvscsi.c \
 	$(SRCDIR)/xen/xen.c \
 	$(SRCDIR)/xen/xennet.c \
 	$(SRCDIR)/x86_64/ap.s \
@@ -81,6 +85,7 @@ SRCS-stage3.img= \
 	$(SRCDIR)/x86_64/flush.c \
 	$(SRCDIR)/x86_64/hpet.c \
 	$(SRCDIR)/x86_64/interrupt.c \
+	$(SRCDIR)/x86_64/kernel.c \
 	$(SRCDIR)/x86_64/kvm_platform.c \
 	$(SRCDIR)/x86_64/mp.c \
 	$(SRCDIR)/x86_64/page.c \
@@ -109,6 +114,12 @@ SRCS-lwip= \
 	$(LWIPDIR)/src/core/ipv4/ip4_addr.c \
 	$(LWIPDIR)/src/core/ipv4/ip4_frag.c \
 	$(LWIPDIR)/src/core/ipv4/ip4.c \
+	$(LWIPDIR)/src/core/ipv6/icmp6.c \
+	$(LWIPDIR)/src/core/ipv6/ip6.c \
+	$(LWIPDIR)/src/core/ipv6/ip6_addr.c \
+	$(LWIPDIR)/src/core/ipv6/ip6_frag.c \
+	$(LWIPDIR)/src/core/ipv6/mld6.c \
+	$(LWIPDIR)/src/core/ipv6/nd6.c \
 	$(LWIPDIR)/src/core/mem.c \
 	$(LWIPDIR)/src/core/memp.c \
 	$(LWIPDIR)/src/core/netif.c \
@@ -138,6 +149,7 @@ INCLUDES=\
 AFLAGS+=-I$(SRCDIR)/x86_64
 
 CFLAGS+=$(KERNCFLAGS) -DSTAGE3 -mcmodel=kernel
+CFLAGS+=-Wno-address # lwIP build sadness
 CFLAGS+=$(INCLUDES)
 
 # Enable tracing by specifying TRACE=ftrace on command line
@@ -150,7 +162,7 @@ endif
 
 #CFLAGS+=	-DLWIPDIR_DEBUG -DEPOLL_DEBUG -DNETSYSCALL_DEBUG -DKERNEL_DEBUG
 AFLAGS+=	-felf64 -I$(OBJDIR)/
-LDFLAGS+=	$(KERNLDFLAGS) -T linker_script
+LDFLAGS+=	$(KERNLDFLAGS) --undefined=_start -T linker_script
 
 VDSO_SRCDIR=    $(SRCDIR)/x86_64
 VDSO_OBJDIR=    $(OBJDIR)/vdso

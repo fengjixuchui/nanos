@@ -203,13 +203,14 @@ void epoll_finish(epoll e)
     refcount_release(&e->refcount);
 }
 
-closure_function(1, 0, sysreturn, epoll_close,
-                 epoll, e)
+closure_function(1, 2, sysreturn, epoll_close,
+                 epoll, e,
+                 thread, t, io_completion, completion)
 {
     epoll e = bound(e);
     release_fdesc(&e->f);
     epoll_finish(e);
-    return 0;
+    return io_complete(completion, t, 0);
 }
 
 sysreturn epoll_create(int flags)
@@ -467,17 +468,20 @@ static void epollfd_update(epollfd efd, fdesc f)
 
 static sysreturn epoll_add_fd(epoll e, int fd, u32 events, u64 data)
 {
-    if (epollfd_from_fd(e, fd) != INVALID_ADDRESS) {
+    epollfd efd = epollfd_from_fd(e, fd);
+    if ((efd != INVALID_ADDRESS) && efd->registered) {
         epoll_debug("   can't add fd %d to epoll %p; already exists\n", fd, e);
         return -EEXIST;
     }
 
     epoll_debug("   adding %d, events 0x%x, data 0x%lx\n", fd, events, data);
-    if (alloc_epollfd(e, fd, events | EPOLLERR | EPOLLHUP, data) == INVALID_ADDRESS)
-        return -ENOMEM;
-
-    epollfd efd = epollfd_from_fd(e, fd);
-    assert(efd != INVALID_ADDRESS);
+    if (efd == INVALID_ADDRESS) {
+        if (alloc_epollfd(e, fd, events | EPOLLERR | EPOLLHUP, data) ==
+                INVALID_ADDRESS)
+            return -ENOMEM;
+        efd = epollfd_from_fd(e, fd);
+        assert(efd != INVALID_ADDRESS);
+    }
     fdesc f = resolve_fd_noret(current->p, efd->fd);
     assert(f);
     register_epollfd(efd, closure(e->h, epoll_wait_notify, efd));
@@ -574,16 +578,15 @@ closure_function(1, 2, void, select_notify,
     assert(w->epoll_type == EPOLL_TYPE_SELECT);
     int count = 0;
     /* XXX need thread safe / cas bitmap ops */
-    /* trusting that notifier masked events */
-    if (events & POLLFDMASK_READ) {
+    if (w->rset && (events & POLLFDMASK_READ)) {
         bitmap_set(w->rset, efd->fd, 1);
         count++;
     }
-    if (events & POLLFDMASK_WRITE) {
+    if (w->wset && (events & POLLFDMASK_WRITE)) {
         bitmap_set(w->wset, efd->fd, 1);
         count++;
     }
-    if (events & POLLFDMASK_EXCEPT) {
+    if (w->eset && (events & POLLFDMASK_EXCEPT)) {
         bitmap_set(w->eset, efd->fd, 1);
         count++;
     }

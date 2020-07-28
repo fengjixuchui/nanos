@@ -4,6 +4,8 @@
 #include <apic.h>
 #include <syscalls.h>
 #include <system_structs.h>
+#include <pagecache.h>
+#include <page.h>
 #include <tfs.h>
 #include <unix.h>
 
@@ -34,6 +36,7 @@ typedef s64 sysreturn;
 // conditionalize
 // fix config/build, remove this include to take off network
 #include <net.h>
+boolean netsyscall_init(unix_heaps uh);
 
 typedef struct process *process;
 typedef struct thread *thread;
@@ -134,6 +137,13 @@ struct blockq;
 typedef struct blockq * blockq;
 
 extern io_completion syscall_io_complete;
+extern io_completion io_completion_ignore;
+
+static inline sysreturn io_complete(io_completion completion, thread t,
+                                    sysreturn rv) {
+    apply(completion, t, rv);
+    return rv;
+}
 
 blockq allocate_blockq(heap h, char * name);
 void deallocate_blockq(blockq bq);
@@ -191,6 +201,12 @@ declare_closure_struct(1, 0, void, run_sighandler,
 declare_closure_struct(1, 1, context, default_fault_handler,
                        thread, t,
                        context, frame);
+declare_closure_struct(7, 0, void, thread_demand_file_page,
+                       thread, t, context, frame, pagecache_node, pn, u64, node_offset,
+                       u64, page_addr, u64, flags, boolean, shared);
+declare_closure_struct(3, 1, void, thread_demand_file_page_complete,
+                       thread, t, context, frame, u64, vaddr,
+                       status, s);
 
 /* XXX probably should bite bullet and allocate these... */
 #define FRAME_MAX_PADDED ((FRAME_MAX + 15) & ~15)
@@ -220,6 +236,8 @@ typedef struct thread {
     closure_struct(run_thread, run_thread);
     closure_struct(run_sighandler, run_sighandler);
     closure_struct(default_fault_handler, fault_handler);
+    closure_struct(thread_demand_file_page, demand_file_page);
+    closure_struct(thread_demand_file_page_complete, demand_file_page_complete);
 
     epoll select_epoll;
     int *clear_tid;
@@ -254,9 +272,9 @@ typedef struct thread {
     cpu_set_t affinity;    
 } *thread;
 
-typedef closure_type(io, sysreturn, void *buf, u64 length, u64 offset, thread t,
+typedef closure_type(file_io, sysreturn, void *buf, u64 length, u64 offset, thread t,
         boolean bh, io_completion completion);
-typedef closure_type(sg_io, sysreturn, sg_list sg, u64 length, u64 offset, thread t,
+typedef closure_type(sg_file_io, sysreturn, sg_list sg, u64 length, u64 offset, thread t,
         boolean bh, io_completion completion);
 
 #define FDESC_TYPE_REGULAR      1
@@ -270,17 +288,14 @@ typedef closure_type(sg_io, sysreturn, sg_list sg, u64 length, u64 offset, threa
 #define FDESC_TYPE_SIGNALFD     9
 #define FDESC_TYPE_TIMERFD     10
 #define FDESC_TYPE_SYMLINK     11
+#define FDESC_TYPE_IORING      12
 
 typedef struct fdesc {
-    io read, write;
-    sg_io sg_read, sg_write;
+    file_io read, write;
+    sg_file_io sg_read, sg_write;
     closure_type(events, u32, thread);
     closure_type(ioctl, sysreturn, unsigned long request, vlist ap);
-
-    /* close() is assumed to not block the calling thread. If any implementation
-     * violates this assumption, the code in dup2() will need to be revisited.
-     */
-    closure_type(close, sysreturn);
+    closure_type(close, sysreturn, thread t, io_completion completion);
 
     u64 refcnt;
     int type;
@@ -292,26 +307,62 @@ typedef struct fdesc {
 
 struct file {
     struct fdesc f;             /* must be first */
-    tuple n;
+    union {
+        struct {
+            fsfile fsf;         /* fsfile for regular files */
+            sg_io fs_read;
+            sg_io fs_write;
+        };
+        tuple meta;             /* meta tuple for others */
+    };
     u64 offset;
     u64 length;
 };
 
+sysreturn ioctl_generic(fdesc f, unsigned long request, vlist ap);
+
 void epoll_finish(epoll e);
 
-#define VMAP_FLAG_MMAP          1
-#define VMAP_FLAG_ANONYMOUS     2
-#define VMAP_FLAG_WRITABLE      4
-#define VMAP_FLAG_EXEC          8
+#define VMAP_FLAG_EXEC     0x0001
+#define VMAP_FLAG_WRITABLE 0x0002
+#define VMAP_FLAG_READABLE 0x0004
+
+#define VMAP_FLAG_MMAP     0x0010
+#define VMAP_FLAG_SHARED   0x0020 /* vs private; same semantics as unix */
+#define VMAP_FLAG_PREALLOC 0x0040
+
+#define VMAP_MMAP_TYPE_MASK       0x0f00
+#define VMAP_MMAP_TYPE_ANONYMOUS  0x0100
+#define VMAP_MMAP_TYPE_FILEBACKED 0x0200
+#define VMAP_MMAP_TYPE_IORING     0x0400
 
 typedef struct vmap {
     struct rmnode node;
-    u64 flags;
+    u32 flags;
+    pagecache_node cache_node;
+    u64 node_offset;
 } *vmap;
 
+typedef struct varea {
+    struct rmnode node;
+    id_heap h;
+    boolean allow_fixed;
+} *varea;
+
+#define ivmap(__f, __o, __c) (struct vmap){.flags = __f, .node_offset = __o, .cache_node = __c}
 typedef closure_type(vmap_handler, void, vmap);
 
-vmap allocate_vmap(rangemap rm, range r, u64 flags);
+static inline u64 page_map_flags(u64 vmflags)
+{
+    u64 flags = PAGE_NO_FAT | PAGE_USER;
+    if ((vmflags & VMAP_FLAG_EXEC) == 0)
+        flags |= PAGE_NO_EXEC;
+    if ((vmflags & VMAP_FLAG_WRITABLE))
+        flags |= PAGE_WRITABLE;
+    return flags;
+}
+
+vmap allocate_vmap(rangemap rm, range r, struct vmap q);
 boolean adjust_process_heap(process p, range new);
 
 typedef struct file *file;
@@ -361,6 +412,16 @@ extern thread dummy_thread;
 #define current ((thread)(current_cpu()->current_thread))
 
 void init_thread_fault_handler(thread t);
+
+static inline fsfile file_get_fsfile(file f)
+{
+    return f->fsf;
+}
+
+static inline tuple file_get_meta(file f)
+{
+    return f->f.type == FDESC_TYPE_REGULAR ? fsfile_get_meta(f->fsf) : f->meta;
+}
 
 static inline thread thread_from_tid(process p, int tid)
 {
@@ -415,6 +476,23 @@ static inline void release_fdesc(fdesc f)
 static inline int fdesc_type(fdesc f)
 {
     return f->type;
+}
+
+static inline fdesc fdesc_get(process p, int fd)
+{
+    /* XXX To ensure atomicity, we need a mutex that protects against concurrent
+     * access to fdesc vector; the same mutex will have to be taken at every fd
+     * number allocation/deallocation. */
+    fdesc f = vector_get(p->files, fd);
+    if (f)
+        fetch_and_add(&f->refcnt, 1);
+    return f;
+}
+
+static inline void fdesc_put(fdesc f)
+{
+    if (fetch_and_add(&f->refcnt, -1) == 1)
+        apply(f->close, 0, io_completion_ignore);
 }
 
 static inline void fdesc_notify_events(fdesc f)
@@ -526,6 +604,7 @@ static inline sigaction sigaction_from_sig(int signum)
 boolean dispatch_signals(thread t);
 void deliver_signal_to_thread(thread t, struct siginfo *);
 void deliver_signal_to_process(process p, struct siginfo *);
+void deliver_fault_signal(u32 signo, thread t, u64 vaddr, s32 si_code);
 
 void _register_syscall(struct syscall *m, int n, sysreturn (*f)(), const char *name);
 
@@ -554,9 +633,11 @@ boolean unix_timers_init(unix_heaps uh);
 #define sysreturn_from_pointer(__x) ((s64)u64_from_pointer(__x));
 
 extern sysreturn syscall_ignore();
-boolean do_demand_page(u64 vaddr, vmap vm);
+boolean do_demand_page(u64 vaddr, vmap vm, context frame);
 vmap vmap_from_vaddr(process p, u64 vaddr);
 void vmap_iterator(process p, vmap_handler vmh);
+void truncate_file_maps(process p, fsfile f, u64 new_length);
+const char *string_from_mmap_type(int type);
 
 void thread_log_internal(thread t, const char *desc, ...);
 #define thread_log(__t, __desc, ...) thread_log_internal(__t, __desc, ##__VA_ARGS__)
@@ -629,6 +710,9 @@ static inline void file_op_maybe_wake(thread t)
     irq_restore(flags);
 }
 
+void iov_op(fdesc f, boolean write, struct iovec *iov, int iovcnt, u64 offset,
+            boolean blocking, io_completion completion);
+
 #define resolve_fd_noret(__p, __fd) vector_get(__p->files, __fd)
 #define resolve_fd(__p, __fd) ({void *f ; if (!(f = resolve_fd_noret(__p, __fd))) return set_syscall_error(current, EBADF); f;})
 
@@ -649,6 +733,14 @@ sysreturn io_submit(aio_context_t ctx_id, long nr, struct iocb **iocbpp);
 sysreturn io_getevents(aio_context_t ctx_id, long min_nr, long nr,
         struct io_event *events, struct timespec *timeout);
 sysreturn io_destroy(aio_context_t ctx_id);
+
+sysreturn io_uring_setup(unsigned int entries, struct io_uring_params *params);
+sysreturn io_uring_mmap(fdesc desc, u64 len, u64 mapflags, u64 offset);
+sysreturn io_uring_enter(int fd, unsigned int to_submit,
+                         unsigned int min_complete, unsigned int flags,
+                         sigset_t *sig);
+sysreturn io_uring_register(int fd, unsigned int opcode, void *arg,
+                            unsigned int nr_args);
 
 int do_pipe2(int fds[2], int flags);
 int pipe_set_capacity(fdesc f, int capacity);

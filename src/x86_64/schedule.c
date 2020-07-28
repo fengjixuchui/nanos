@@ -1,7 +1,10 @@
 #include <kernel.h>
-#include <tfs.h> // needed for unix.h
-#include <unix.h> // some deps
 #include <apic.h>
+
+// XXX these three should go away along with thread_pause below
+#include <pagecache.h>
+#include <tfs.h>
+#include <unix.h>
 
 
 /* Try to keep these within the confines of the runloop lock so we
@@ -25,6 +28,7 @@ static char *state_strings_backing[] = {
 char **state_strings = state_strings_backing;
 static int wakeup_vector;
 int shutdown_vector;
+boolean shutting_down;
 
 queue runqueue;                 /* kernel space from ?*/
 queue bhqueue;                  /* kernel from interrupt */
@@ -140,14 +144,12 @@ NOTRACE void __attribute__((noreturn)) runloop_internal()
         ci->state = cpu_kernel;
         timer_service(runloop_timers, now(CLOCK_ID_MONOTONIC));
 
-        /* serve bhqueue to completion */
+        /* serve bhqueue and runqueue to completion */
         while ((t = dequeue(bhqueue)) != INVALID_ADDRESS) {
             run_thunk(t, cpu_kernel);
         }
 
-        /* serve existing, but not additionally queued (deferred), items on runqueue */
-        u64 n_rq = queue_length(runqueue);
-        while (n_rq-- > 0 && (t = dequeue(runqueue)) != INVALID_ADDRESS) {
+        while ((t = dequeue(runqueue)) != INVALID_ADDRESS) {
             run_thunk(t, cpu_kernel);
         }
 
@@ -158,8 +160,9 @@ NOTRACE void __attribute__((noreturn)) runloop_internal()
         kern_unlock();
     }
 
-    if ((t = dequeue(thread_queue)) != INVALID_ADDRESS)
+    if (!shutting_down && (t = dequeue(thread_queue)) != INVALID_ADDRESS)
         run_thunk(t, cpu_user);
+// XXX redo with frame pause
     if (ci->current_thread)
         thread_pause(ci->current_thread);
 
@@ -187,4 +190,5 @@ void init_scheduler(heap h)
     thread_queue = allocate_queue(h, 64);
     runloop_timers = allocate_timerheap(h, "runloop");
     assert(runloop_timers != INVALID_ADDRESS);
+    shutting_down = false;
 }

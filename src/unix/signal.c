@@ -937,8 +937,6 @@ closure_function(1, 6, sysreturn, signalfd_read,
                  signal_fd, sfd,
                  void *, buf, u64, length, u64, offset_arg, thread, t, boolean, bh, io_completion, completion)
 {
-    if (length < sizeof(struct signalfd_siginfo))
-        return 0;
     signal_fd sfd = bound(sfd);
     sig_debug("fd %d, buf %p, length %ld, tid %d, bh %d\n", sfd->fd, buf, length, t->tid, bh);
     blockq_action ba = closure(sfd->h, signalfd_read_bh, sfd, t, buf, length, completion);
@@ -952,8 +950,9 @@ closure_function(1, 1, u32, signalfd_events,
     return (get_all_pending_signals(t) & bound(sfd)->mask) ? EPOLLIN : 0;
 }
 
-closure_function(1, 0, sysreturn, signalfd_close,
-                 signal_fd, sfd)
+closure_function(1, 2, sysreturn, signalfd_close,
+                 signal_fd, sfd,
+                 thread, t, io_completion, completion)
 {
     signal_fd sfd = bound(sfd);
     deallocate_blockq(sfd->bq);
@@ -963,7 +962,7 @@ closure_function(1, 0, sysreturn, signalfd_close,
     deallocate_closure(sfd->f.close);
     release_fdesc(&sfd->f);
     deallocate(sfd->h, sfd, sizeof(struct signal_fd));
-    return 0;
+    return io_complete(completion, t, 0);
 }
 
 closure_function(1, 2, void, signalfd_notify,

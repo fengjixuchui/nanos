@@ -6,6 +6,8 @@ typedef struct list {
 #define struct_from_list(l, s, f) ((s)pointer_from_u64(u64_from_pointer(l) - offsetof(s, f)))
 #define list_foreach(l, e) \
     for (list __next, e = list_begin(l); __next = e->next, e != list_end(l); e = __next)
+#define list_foreach_reverse(l, e) \
+    for (list __next, e = (l)->prev; __next = e->prev, e != (l); e = __next)
 
 static inline void list_init(struct list * head)
 {
@@ -71,4 +73,27 @@ static inline struct list *list_pop_back(struct list *list)
     struct list *back = list_end(list)->prev;
     list_delete(back);
     return back;
+}
+
+static inline boolean list_find(struct list *head, struct list *elem)
+{
+    list_foreach(head, e) {
+        if (e == elem)
+            return true;
+    }
+    return false;
+}
+
+/* Move all elements from source list to destination list. */
+static inline void list_move(struct list *dest, struct list *src)
+{
+    if (list_empty(src)) {
+        list_init(dest);
+        return;
+    }
+    dest->next = src->next;
+    dest->next->prev = dest;
+    dest->prev = src->prev;
+    dest->prev->next = dest;
+    list_init(src); /* make it an empty list */
 }

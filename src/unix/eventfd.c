@@ -52,7 +52,7 @@ closure_function(1, 6, sysreturn, efd_read,
                  void *, buf, u64, length, u64, offset_arg, thread, t, boolean, bh, io_completion, completion)
 {
     if (length < sizeof(u64)) {
-        return -EINVAL;
+        return io_complete(completion, t, -EINVAL);
     }
 
     blockq_action ba = closure(bound(efd)->h, efd_read_bh, bound(efd), t, buf, length,
@@ -95,7 +95,7 @@ closure_function(1, 6, sysreturn, efd_write,
                  void *, buf, u64, length, u64, offset, thread, t, boolean, bh, io_completion, completion)
 {
     if (length < sizeof(u64)) {
-        return -EINVAL;
+        return io_complete(completion, t, -EINVAL);
     }
 
     blockq_action ba = closure(bound(efd)->h, efd_write_bh, bound(efd), t, buf, length,
@@ -117,8 +117,9 @@ closure_function(1, 1, u32, efd_events,
     return events;
 }
 
-closure_function(1, 0, sysreturn, efd_close,
-                 struct efd *, efd)
+closure_function(1, 2, sysreturn, efd_close,
+                 struct efd *, efd,
+                 thread, t, io_completion, completion)
 {
     struct efd *efd = bound(efd);
     deallocate_blockq(efd->read_bq);
@@ -129,7 +130,7 @@ closure_function(1, 0, sysreturn, efd_close,
     deallocate_closure(efd->f.close);
     release_fdesc(&efd->f);
     deallocate(efd->h, efd, sizeof(*efd));
-    return 0;
+    return io_complete(completion, t, 0);
 }
 
 int do_eventfd2(unsigned int count, int flags)

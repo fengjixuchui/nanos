@@ -1,6 +1,5 @@
 #include <unix_internal.h>
 #include <filesystem.h>
-#include <page.h>
 
 // lifted from linux UAPI
 #define DT_UNKNOWN	0
@@ -16,10 +15,10 @@
 sysreturn close(int fd);
 
 io_completion syscall_io_complete;
+io_completion io_completion_ignore;
 
 void register_other_syscalls(struct syscall *map)
 {
-    register_syscall(map, msync, 0);
     register_syscall(map, shmget, 0);
     register_syscall(map, shmat, 0);
     register_syscall(map, shmctl, 0);
@@ -39,8 +38,8 @@ void register_other_syscalls(struct syscall *map)
     register_syscall(map, link, 0);
     register_syscall(map, chmod, syscall_ignore);
     register_syscall(map, fchmod, syscall_ignore);
-    register_syscall(map, fchown, 0);
-    register_syscall(map, lchown, 0);
+    register_syscall(map, fchown, syscall_ignore);
+    register_syscall(map, lchown, syscall_ignore);
     register_syscall(map, ptrace, 0);
     register_syscall(map, syslog, 0);
     register_syscall(map, getgid, syscall_ignore);
@@ -84,7 +83,6 @@ void register_other_syscalls(struct syscall *map)
     register_syscall(map, _sysctl, 0);
     register_syscall(map, adjtimex, 0);
     register_syscall(map, chroot, 0);
-    register_syscall(map, sync, 0);
     register_syscall(map, acct, 0);
     register_syscall(map, settimeofday, 0);
     register_syscall(map, mount, 0);
@@ -154,7 +152,7 @@ void register_other_syscalls(struct syscall *map)
     register_syscall(map, inotify_rm_watch, 0);
     register_syscall(map, migrate_pages, 0);
     register_syscall(map, mknodat, 0);
-    register_syscall(map, fchownat, 0);
+    register_syscall(map, fchownat, syscall_ignore);
     register_syscall(map, futimesat, 0);
     register_syscall(map, linkat, 0);
     register_syscall(map, fchmodat, syscall_ignore);
@@ -178,7 +176,6 @@ void register_other_syscalls(struct syscall *map)
     register_syscall(map, name_to_handle_at, 0);
     register_syscall(map, open_by_handle_at, 0);
     register_syscall(map, clock_adjtime, 0);
-    register_syscall(map, syncfs, 0);
     register_syscall(map, setns, 0);
     register_syscall(map, getcpu, 0);
     register_syscall(map, process_vm_readv, 0);
@@ -308,7 +305,8 @@ boolean validate_iovec(struct iovec *iov, u64 len, boolean write)
     if (!validate_user_memory(iov, sizeof(struct iovec) * len, false))
         return false;
     for (u64 i = 0; i < len; i++) {
-        if (!validate_user_memory(iov[i].iov_base, iov[i].iov_len, write))
+        if ((iov[i].iov_len != 0) &&
+                !validate_user_memory(iov[i].iov_base, iov[i].iov_len, write))
             return false;
     }
     return true;
@@ -316,21 +314,29 @@ boolean validate_iovec(struct iovec *iov, u64 len, boolean write)
 
 struct iov_progress {
     boolean initialized;
+    boolean blocking;
+    u64 file_offset;
     int curr;
     u64 curr_offset;
     u64 total_len;
     io_completion completion;
 };
 
-closure_function(4, 2, void, iov_op_each_complete,
-                 io, op, struct iovec *, iov, int, iovcnt, struct iov_progress, progress,
+closure_function(5, 2, void, iov_op_each_complete,
+                 fdesc, f, boolean, write, struct iovec *, iov, int, iovcnt, struct iov_progress, progress,
                  thread, t, sysreturn, rv)
 {
     io_completion c;
     int iovcnt = bound(iovcnt);
     struct iov_progress * p = &bound(progress);
     struct iovec * iov = bound(iov);
+    fdesc f = bound(f);
+    boolean write = bound(write);
     thread_log(t, "%s: rv %ld, curr %d, iovcnt %d", __func__, rv, p->curr, iovcnt);
+
+    file_io op = write ? f->write : f->read;
+    if (!op)
+        rv = -EOPNOTSUPP;
 
     /* If these ops were truly atomic, we would have to rewind file
        state on failure... */
@@ -352,22 +358,27 @@ closure_function(4, 2, void, iov_op_each_complete,
     }
 
     /* If we're done, return the total length... */
-    if (p->curr == iovcnt) {
+    if ((p->curr == iovcnt) || ((rv == 0) && p->initialized) ||
+            ((p->total_len != 0) && f->events &&
+            !(apply(f->events, t) & (write ? EPOLLOUT : EPOLLIN)))) {
         rv = p->total_len;
         goto out_complete;
     }
 
-    boolean initialized = p->initialized;
     p->initialized = true;
+    boolean blocking = p->blocking;
+    p->blocking = false;
+    if (p->file_offset != infinity)
+        p->file_offset += rv;
 
     /* ...else issue the next request. */
-    thread_log(t, "   op: curr %d, offset %ld, @ %p, len %ld, init %d",
+    thread_log(t, "   op: curr %d, offset %ld, @ %p, len %ld, blocking %d",
                p->curr, p->curr_offset,
                iov[p->curr].iov_base + p->curr_offset,
-               iov[p->curr].iov_len - p->curr_offset, initialized);
-    apply(bound(op), iov[p->curr].iov_base + p->curr_offset,
+               iov[p->curr].iov_len - p->curr_offset, blocking);
+    apply(op, iov[p->curr].iov_base + p->curr_offset,
           iov[p->curr].iov_len - p->curr_offset,
-          infinity /* file offset */, t, initialized,
+          p->file_offset, t, !blocking,
           (io_completion)closure_self());
     return;
   out_complete:
@@ -376,23 +387,26 @@ closure_function(4, 2, void, iov_op_each_complete,
     apply(c, t, rv);
 }
 
-static sysreturn iov_op(fdesc f, io op, struct iovec *iov, int iovcnt, io_completion completion)
+void iov_op(fdesc f, boolean write, struct iovec *iov, int iovcnt, u64 offset,
+            boolean blocking, io_completion completion)
 {
     if (iovcnt < 0 || iovcnt > IOV_MAX)
-        return set_syscall_error(current, EINVAL);
+        apply(completion, current, -EINVAL);
     if (iovcnt == 0)
-        return 0;
+        apply(completion, current, 0);
 
     heap h = heap_general(get_kernel_heaps());
     struct iov_progress p;
     p.initialized = false;
+    p.blocking = blocking;
+    p.file_offset = offset;
     p.curr = 0;
     p.curr_offset = 0;
     p.total_len = 0;
     p.completion = completion;
-    io_completion each = closure(h, iov_op_each_complete, op, iov, iovcnt, p);
+    io_completion each = closure(h, iov_op_each_complete, f, write, iov, iovcnt,
+        p);
     apply(each, current, 0);
-    return get_syscall_return(current);
 }
 
 sysreturn read(int fd, u8 *dest, bytes length)
@@ -424,7 +438,8 @@ sysreturn readv(int fd, struct iovec *iov, int iovcnt)
     if (!validate_iovec(iov, iovcnt, true))
         return -EFAULT;
     fdesc f = resolve_fd(current->p, fd);
-    return iov_op(f, f->read, iov, iovcnt, syscall_io_complete);
+    iov_op(f, false, iov, iovcnt, infinity, true, syscall_io_complete);
+    return get_syscall_return(current);
 }
 
 sysreturn write(int fd, u8 *body, bytes length)
@@ -455,51 +470,13 @@ sysreturn writev(int fd, struct iovec *iov, int iovcnt)
     if (!validate_iovec(iov, iovcnt, false))
         return -EFAULT;
     fdesc f = resolve_fd(current->p, fd);
-    return iov_op(f, f->write, iov, iovcnt, syscall_io_complete);
+    iov_op(f, true, iov, iovcnt, infinity, true, syscall_io_complete);
+    return get_syscall_return(current);
 }
 
 static boolean is_special(tuple n)
 {
     return table_find(n, sym(special)) ? true : false;
-}
-
-static inline void file_op_complete_internal(thread t, file f, fsfile fsf, boolean is_file_offset,
-                                             io_completion completion, status s, bytes length)
-{
-    thread_log(t, "%s: len %d, status %v (%s)", __func__,
-            length, s, is_ok(s) ? "OK" : "NOTOK");
-    sysreturn rv;
-    if (is_ok(s)) {
-        /* if regular file, update length */
-        if (fsf)
-            f->length = fsfile_get_length(fsf);
-        if (is_file_offset) /* vs specified offset (pread) */
-            f->offset += length;
-        rv = length;
-    } else {
-        /* report these to console for now */
-        msg_err("file op failed with %v\n", s);
-        rv = -EIO;
-    }
-    apply(completion, t, rv);
-}
-
-closure_function(5, 2, void, file_op_complete,
-                 thread, t, file, f, fsfile, fsf, boolean, is_file_offset, io_completion, completion,
-                 status, s, bytes, length)
-{
-    file_op_complete_internal(bound(t), bound(f), bound(fsf), bound(is_file_offset),
-                              bound(completion), s, length);
-    closure_finish();
-}
-
-closure_function(6, 1, void, file_op_complete_sg,
-                 thread, t, file, f, fsfile, fsf, sg_list, sg, boolean, is_file_offset, io_completion, completion,
-                 status, s)
-{
-    file_op_complete_internal(bound(t), bound(f), bound(fsf), bound(is_file_offset),
-                              bound(completion), s, bound(sg)->count);
-    closure_finish();
 }
 
 closure_function(9, 2, void, sendfile_bh,
@@ -541,12 +518,12 @@ closure_function(9, 2, void, sendfile_bh,
             *bound(offset) += rv;
         bound(cur_buf) = sg_list_head_remove(bound(sg)); /* initial dequeue */
         assert(bound(cur_buf) != INVALID_ADDRESS);
-        bound(cur_buf)->misc = 0; /* offset for our use */
+        bound(cur_buf)->offset = 0; /* offset for our use */
         thread_log(t, "   read %ld bytes\n", rv);
     } else {
         bound(written) += rv;
-        bound(cur_buf)->misc += rv;
-        if (bound(cur_buf)->misc == bound(cur_buf)->length) {
+        bound(cur_buf)->offset += rv;
+        if (bound(cur_buf)->offset == bound(cur_buf)->size) {
             sg_buf_release(bound(cur_buf));
             if (bound(written) == bound(readlen)) {
                 rv = bound(written);
@@ -554,15 +531,15 @@ closure_function(9, 2, void, sendfile_bh,
             }
             bound(cur_buf) = sg_list_head_remove(bound(sg));
             assert(bound(cur_buf) != INVALID_ADDRESS);
-            bound(cur_buf)->misc = 0; /* offset for our use */
+            bound(cur_buf)->offset = 0; /* offset for our use */
         }
-        assert(bound(cur_buf)->misc < bound(cur_buf)->length);
+        assert(bound(cur_buf)->offset < bound(cur_buf)->size);
     }
 
     /* issue next write */
     assert(bound(cur_buf));
-    void *buf = bound(cur_buf)->buf + bound(cur_buf)->misc;
-    u32 n = bound(cur_buf)->length - bound(cur_buf)->misc;
+    void *buf = bound(cur_buf)->buf + bound(cur_buf)->offset;
+    u32 n = bound(cur_buf)->size - bound(cur_buf)->offset;
     thread_log(t, "   writing %d bytes from %p", rv, n, buf);
     apply(bound(out)->write, buf, n, 0, t, true, (io_completion)closure_self());
     return;
@@ -608,9 +585,29 @@ static sysreturn sendfile(int out_fd, int in_fd, int *offset, bytes count)
 static void begin_file_read(thread t, file f)
 {
     if ((f->length > 0) && !(f->f.flags & O_NOATIME)) {
-        filesystem_update_atime(t->p->fs, f->n);
+        filesystem_update_atime(t->p->fs, file_get_meta(f));
     }
     file_op_begin(t);
+}
+
+closure_function(7, 1, void, file_read_complete,
+                 thread, t, sg_list, sg, void *, dest, u64, limit, file, f, boolean, is_file_offset, io_completion, completion,
+                 status, s)
+{
+    thread_log(bound(t), "%s: status %v", __func__, s);
+    sysreturn rv;
+    if (is_ok(s)) {
+        file f = bound(f);
+        u64 count = sg_copy_to_buf_and_release(bound(dest), bound(sg), bound(limit));
+        thread_log(bound(t), "   read count %ld\n", count);
+        if (bound(is_file_offset)) /* vs specified offset (pread) */
+            f->offset += count;
+        rv = count;
+    } else {
+        rv = sysreturn_from_fs_status_value(s);
+    }
+    apply(bound(completion), bound(t), rv);
+    closure_finish();
 }
 
 closure_function(2, 6, sysreturn, file_read,
@@ -618,68 +615,7 @@ closure_function(2, 6, sysreturn, file_read,
                  void *, dest, u64, length, u64, offset_arg, thread, t, boolean, bh, io_completion, completion)
 {
     file f = bound(f);
-    fsfile fsf = bound(fsf);
 
-    boolean is_file_offset = offset_arg == infinity;
-    u64 offset = is_file_offset ? f->offset : offset_arg;
-    thread_log(t, "%s: f %p, dest %p, offset %ld (%s), length %ld, file length %ld",
-               __func__, f, dest, offset, is_file_offset ? "file" : "specified",
-               length, f->length);
-
-    if (is_special(f->n)) {
-        return spec_read(f, dest, length, offset, t, bh, completion);
-    }
-    if (offset >= f->length) {
-        return 0;
-    }
-    begin_file_read(t, f);
-    filesystem_read_linear(t->p->fs, f->n, dest, length, offset,
-                           closure(heap_general(get_kernel_heaps()),
-                                   file_op_complete, t, f, fsf, is_file_offset,
-                                   completion));
-
-    /* possible direct return in top half */
-    return bh ? SYSRETURN_CONTINUE_BLOCKING : file_op_maybe_sleep(t);
-}
-
-closure_function(2, 6, sysreturn, file_sg_read,
-                 file, f, fsfile, fsf,
-                 sg_list, sg, u64, length, u64, offset_arg, thread, t, boolean, bh, io_completion, completion)
-{
-    file f = bound(f);
-    fsfile fsf = bound(fsf);
-
-    boolean is_file_offset = offset_arg == infinity;
-    u64 offset = is_file_offset ? f->offset : offset_arg;
-    thread_log(t, "%s: f %p, sg %p, offset %ld (%s), length %ld, file length %ld",
-               __func__, f, sg, offset, is_file_offset ? "file" : "specified",
-               length, f->length);
-
-    /* TODO: special files not supported yet */
-    if (is_special(f->n)) {
-        apply(completion, t, -EIO);
-        goto out;
-    }
-
-    begin_file_read(t, f);
-    filesystem_read_sg(t->p->fs, f->n, sg, length, offset,
-                       closure(heap_general(get_kernel_heaps()),
-                               file_op_complete_sg, t, f, fsf, sg, is_file_offset,
-                               completion));
-
-  out:
-    /* possible direct return in top half */
-    return bh ? SYSRETURN_CONTINUE_BLOCKING : file_op_maybe_sleep(t);
-}
-
-#define PAD_WRITES 0
-
-closure_function(2, 6, sysreturn, file_write,
-                 file, f, fsfile, fsf,
-                 void *, dest, u64, length, u64, offset_arg, thread, t, boolean, bh, io_completion, completion)
-{
-    file f = bound(f);
-    fsfile fsf = bound(fsf);
     boolean is_file_offset = offset_arg == infinity;
     u64 offset = is_file_offset ? f->offset : offset_arg;
     thread_log(t, "%s: f %p, dest %p, offset %ld (%s), length %ld, file length %ld",
@@ -687,56 +623,138 @@ closure_function(2, 6, sysreturn, file_write,
                length, f->length);
     heap h = heap_general(get_kernel_heaps());
 
-    u64 final_length = 0;
-    void *buf = INVALID_ADDRESS;
-    while (length != 0) {
-        final_length = PAD_WRITES ? pad(length, SECTOR_SIZE) : length;
-        buf = allocate(h, final_length);
-        if (buf != INVALID_ADDRESS) {
-            break;
-        } else {
-            /* Couldn't allocate that much memory, retry with a smaller size. */
-            length >>= 1;
-        }
+    if (f->f.type == FDESC_TYPE_SPECIAL) {
+        return spec_read(f, dest, length, offset, t, bh, completion);
     }
-
-    /* XXX we shouldn't need to copy here, however if we at some point
-       want to support non-blocking, we'll need to fix the unaligned
-       block rmw in the extent write (prob just break it up into
-       aligned and unaligned portions, copying aligned data straight
-       to dma buffer and stashing unaligned portions to be copied post
-       block read) */
-
-    /* copy from userspace, XXX: check pointer safety */
-    runtime_memset(buf, 0, final_length);
-    runtime_memcpy(buf, dest, length);
-
-    if (is_special(f->n)) {
-        return spec_write(f, buf, length, offset, t, bh, completion);
+    if (offset >= f->length) {
+        return io_complete(completion, t, 0);
     }
-
-    buffer b = wrap_buffer(h, buf, final_length);
-    thread_log(t, "%s: b_ref: %p", __func__, buffer_ref(b, 0));
-
-    if (final_length > 0) {
-        filesystem_update_mtime(t->p->fs, f->n);
+    sg_list sg = allocate_sg_list();
+    if (sg == INVALID_ADDRESS) {
+        thread_log(t, "   unable to allocate sg list");
+        return -ENOMEM;
     }
-    file_op_begin(t);
-    filesystem_write(t->p->fs, f->n, b, offset,
-                     closure(h, file_op_complete, t, f, fsf, is_file_offset,
-                     completion));
-
+    begin_file_read(t, f);
+    apply(f->fs_read, sg, irangel(offset, length), closure(h, file_read_complete, t, sg, dest, length,
+                                                           f, is_file_offset, completion));
     /* possible direct return in top half */
     return bh ? SYSRETURN_CONTINUE_BLOCKING : file_op_maybe_sleep(t);
 }
 
-closure_function(2, 0, sysreturn, file_close,
-                 file, f, fsfile, fsf)
+closure_function(5, 1, void, file_sg_read_complete,
+                 thread, t, file, f, sg_list, sg, boolean, is_file_offset, io_completion, completion,
+                 status, s)
+{
+    thread_log(bound(t), "%s: status %v", __func__, s);
+    sysreturn rv;
+    if (is_ok(s)) {
+       u64 length = bound(sg)->count;
+       file f = bound(f);
+        if (bound(is_file_offset)) /* vs specified offset (pread) */
+            f->offset += length;
+        rv = length;
+    } else {
+        rv = -EIO;
+    }
+    apply(bound(completion), bound(t), rv);
+}
+
+closure_function(2, 6, sysreturn, file_sg_read,
+                 file, f, fsfile, fsf,
+                 sg_list, sg, u64, length, u64, offset_arg, thread, t, boolean, bh, io_completion, completion)
+{
+    file f = bound(f);
+
+    boolean is_file_offset = offset_arg == infinity;
+    u64 offset = is_file_offset ? f->offset : offset_arg;
+    thread_log(t, "%s: f %p, sg %p, offset %ld (%s), length %ld, file length %ld",
+               __func__, f, sg, offset, is_file_offset ? "file" : "specified",
+               length, f->length);
+    heap h = heap_general(get_kernel_heaps());
+
+    /* TODO: special files not supported yet */
+    if (f->f.type == FDESC_TYPE_SPECIAL) {
+        apply(completion, t, -EIO);
+        goto out;
+    }
+
+    begin_file_read(t, f);
+    apply(f->fs_read, sg, irangel(offset, length), closure(h, file_sg_read_complete,
+                                                           t, f, sg, is_file_offset, completion));
+  out:
+    /* possible direct return in top half */
+    return bh ? SYSRETURN_CONTINUE_BLOCKING : file_op_maybe_sleep(t);
+}
+
+closure_function(6, 1, void, file_write_complete,
+                 thread, t, file, f, sg_list, sg, u64, length, boolean, is_file_offset, io_completion, completion,
+                 status, s)
+{
+    thread_log(bound(t), "%s: f %p, sg, %p, completion %F, status %v",
+               __func__, bound(f), bound(sg), bound(completion), s);
+    sysreturn rv;
+    sg_list_release(bound(sg));
+    deallocate_sg_list(bound(sg));
+    if (is_ok(s)) {
+        file f = bound(f);
+        /* if regular file, update length */
+        if (f->fsf)
+            f->length = fsfile_get_length(f->fsf);
+        if (bound(is_file_offset)) /* vs specified offset (pread) */
+            f->offset += bound(length);
+        rv = bound(length);
+    } else {
+        rv = sysreturn_from_fs_status_value(s);
+    }
+    apply(bound(completion), bound(t), rv);
+    closure_finish();
+}
+
+closure_function(2, 6, sysreturn, file_write,
+                 file, f, fsfile, fsf,
+                 void *, src, u64, length, u64, offset_arg, thread, t, boolean, bh, io_completion, completion)
+{
+    file f = bound(f);
+    boolean is_file_offset = offset_arg == infinity;
+    u64 offset = is_file_offset ? f->offset : offset_arg;
+    thread_log(t, "%s: f %p, src %p, offset %ld (%s), length %ld, file length %ld",
+               __func__, f, src, offset, is_file_offset ? "file" : "specified",
+               length, f->length);
+    heap h = heap_general(get_kernel_heaps());
+
+    if (f->f.type == FDESC_TYPE_SPECIAL) {
+        return spec_write(f, src, length, offset, t, bh, completion);
+    }
+
+    sg_list sg = allocate_sg_list();
+    if (sg == INVALID_ADDRESS) {
+        thread_log(t, "   unable to allocate sg list");
+        return -ENOMEM;
+    }
+    sg_buf sgb = sg_list_tail_add(sg, length);
+    sgb->buf = src;
+    sgb->size = length;
+    sgb->offset = 0;
+    sgb->refcount = 0;
+
+    if (length > 0) {
+        filesystem_update_mtime(t->p->fs, file_get_meta(f));
+    }
+    file_op_begin(t);
+    apply(f->fs_write, sg, irangel(offset, length), closure(h, file_write_complete,
+                                                            t, f, sg, length, is_file_offset, completion));
+    /* possible direct return in top half */
+    return bh ? SYSRETURN_CONTINUE_BLOCKING : file_op_maybe_sleep(t);
+}
+
+closure_function(2, 2, sysreturn, file_close,
+                 file, f, fsfile, fsf,
+                 thread, t, io_completion, completion)
 {
     sysreturn ret = 0;
     file f = bound(f);
 
-    if (is_special(f->n)) {
+    if (f->f.type == FDESC_TYPE_SPECIAL) {
         ret = spec_close(f);
     }
         
@@ -744,7 +762,7 @@ closure_function(2, 0, sysreturn, file_close,
         release_fdesc(&f->f);
         unix_cache_free(get_unix_heaps(), file, f);
     }
-    return 0;
+    return io_complete(completion, t, 0);
 }
 
 closure_function(1, 1, u32, file_events,
@@ -753,7 +771,7 @@ closure_function(1, 1, u32, file_events,
 {
     file f = bound(f);
     u32 events;
-    if (is_special(f->n)) {
+    if (f->f.type == FDESC_TYPE_SPECIAL) {
         events = spec_events(f);
     } else {
         /* XXX add nonblocking support */
@@ -828,8 +846,7 @@ sysreturn open_internal(tuple cwd, const char *name, int flags, int mode)
             thread_log(current, "\"%s\" opened with O_EXCL but already exists", name);
             return set_syscall_error(current, EEXIST);
         } else if ((ret == -ENOENT) && parent) {
-            n = filesystem_creat(current->p->fs, parent,
-                    filename_from_path(name), ignore_status);
+            n = filesystem_creat(current->p->fs, parent, filename_from_path(name));
             if (n) {
                 filesystem_update_mtime(current->p->fs, parent);
                 ret = 0;
@@ -850,11 +867,8 @@ sysreturn open_internal(tuple cwd, const char *name, int flags, int mode)
     int type = file_type_from_tuple(n);
     if (type == FDESC_TYPE_REGULAR) {
         fsf = fsfile_from_node(current->p->fs, n);
-        if (!fsf) {
-            length = 0;
-        } else {
-            length = fsfile_get_length(fsf);
-        }
+        assert(fsf);
+        length = fsfile_get_length(fsf);
     }
 
     file f = unix_cache_alloc(uh, file);
@@ -877,11 +891,19 @@ sysreturn open_internal(tuple cwd, const char *name, int flags, int mode)
     f->f.close = closure(h, file_close, f, fsf);
     f->f.events = closure(h, file_events, f);
     f->f.flags = flags;
-    f->n = n;
+    if (type == FDESC_TYPE_REGULAR) {
+        f->fsf = fsf;
+        f->fs_read = fsfile_get_reader(fsf);
+        assert(f->fs_read);
+        f->fs_write = fsfile_get_writer(fsf);
+        assert(f->fs_write);
+    } else {
+        f->meta = n;
+    }
     f->length = length;
     f->offset = (flags & O_APPEND) ? length : 0;
 
-    if (is_special(f->n)) {
+    if (type == FDESC_TYPE_SPECIAL) {
         int spec_ret = spec_open(f);
         if (spec_ret != 0) {
             assert(spec_ret < 0);
@@ -922,16 +944,17 @@ sysreturn dup2(int oldfd, int newfd)
     thread_log(current, "%s: oldfd %d, newfd %d", __func__, oldfd, newfd);
     fdesc f = resolve_fd(current->p, oldfd);
     if (newfd != oldfd) {
-        if (resolve_fd_noret(current->p, newfd)) {
-            /* The code below assumes that close() never blocks the calling
-             * thread. If there is a close() implementation that potentially
-             * blocks, this will need to be revisited. */
-            close(newfd);
-        }
-        int fd = allocate_fd_gte(current->p, newfd, f);
-        if (fd != newfd) {
-            thread_log(current, "failed to reuse newfd");
-            return -EMFILE;
+        fdesc newf = fdesc_get(current->p, newfd);
+        if (newf) {
+            vector_set(current->p->files, newfd, f);
+            if (fetch_and_add(&newf->refcnt, -2) == 2)
+                apply(newf->close, current, io_completion_ignore);
+        } else {
+            newfd = allocate_fd_gte(current->p, newfd, f);
+            if (newfd == INVALID_PHYSICAL) {
+                thread_log(current, "  failed to use newfd");
+                return -EMFILE;
+            }
         }
         fetch_and_add(&f->refcnt, 1);
     }
@@ -951,18 +974,6 @@ sysreturn dup3(int oldfd, int newfd, int flags)
     return dup2(oldfd, newfd);
 }
 
-closure_function(1, 1, void, mkdir_complete,
-                 thread, t,
-                 status, s)
-{
-    thread t = bound(t);
-    thread_log(current, "%s: status %v (%s)", __func__, s,
-            is_ok(s) ? "OK" : "NOTOK");
-    set_syscall_return(t, is_ok(s) ? 0 : -EIO);
-    file_op_maybe_wake(t);
-    closure_finish();
-}
-
 static sysreturn mkdir_internal(tuple cwd, const char *pathname, int mode)
 {
     tuple parent;
@@ -970,11 +981,12 @@ static sysreturn mkdir_internal(tuple cwd, const char *pathname, int mode)
     if ((ret != -ENOENT) || !parent) {
         return set_syscall_return(current, ret);
     }
+    buffer b = little_stack_buffer(NAME_MAX + 1);
+    if (!dirname_from_path(b, pathname))
+        return -ENAMETOOLONG;
     filesystem_update_mtime(current->p->fs, parent);
-    file_op_begin(current);
-    filesystem_mkdir(current->p->fs, parent, filename_from_path(pathname),
-            closure(heap_general(get_kernel_heaps()), mkdir_complete, current));
-    return file_op_maybe_sleep(current);
+    filesystem_mkdir(current->p->fs, parent, (char *)buffer_ref(b, 0));
+    return set_syscall_return(current, 0);
 }
 
 sysreturn mkdir(const char *pathname, int mode)
@@ -1071,7 +1083,7 @@ sysreturn getdents(int fd, struct linux_dirent *dirp, unsigned int count)
     if (!validate_user_memory(dirp, count, true))
         return set_syscall_error(current, EFAULT);
     file f = resolve_fd(current->p, fd);
-    tuple c = children(f->n);
+    tuple c = children(file_get_meta(f));
     if (!c)
         return -ENOTDIR;
 
@@ -1080,7 +1092,7 @@ sysreturn getdents(int fd, struct linux_dirent *dirp, unsigned int count)
     buffer tmpbuf = little_stack_buffer(NAME_MAX + 1);
     table_foreach(c, k, v) {
         char *p = cstring(symbol_string(k), tmpbuf);
-        r = try_write_dirent(f->n, dirp, p,
+        r = try_write_dirent(file_get_meta(f), dirp, p,
                     &read_sofar, &written_sofar, &f->offset, &count,
                     dt_from_tuple(v));
         if (r < 0)
@@ -1090,7 +1102,7 @@ sysreturn getdents(int fd, struct linux_dirent *dirp, unsigned int count)
     }
 
 done:
-    filesystem_update_atime(current->p->fs, f->n);
+    filesystem_update_atime(current->p->fs, file_get_meta(f));
     f->offset = read_sofar;
     if (r < 0 && written_sofar == 0)
         return -EINVAL;
@@ -1137,7 +1149,7 @@ sysreturn getdents64(int fd, struct linux_dirent64 *dirp, unsigned int count)
     if (!validate_user_memory(dirp, count, true))
         return set_syscall_error(current, EFAULT);
     file f = resolve_fd(current->p, fd);
-    tuple c = children(f->n);
+    tuple c = children(file_get_meta(f));
     if (!c)
         return -ENOTDIR;
 
@@ -1146,7 +1158,7 @@ sysreturn getdents64(int fd, struct linux_dirent64 *dirp, unsigned int count)
     buffer tmpbuf = little_stack_buffer(NAME_MAX + 1);
     table_foreach(c, k, v) {
         char *p = cstring(symbol_string(k), tmpbuf);
-        r = try_write_dirent64(f->n, dirp, p,
+        r = try_write_dirent64(file_get_meta(f), dirp, p,
                     &read_sofar, &written_sofar, &f->offset, &count,
                     dt_from_tuple(v));
         if (r < 0)
@@ -1156,7 +1168,7 @@ sysreturn getdents64(int fd, struct linux_dirent64 *dirp, unsigned int count)
     }
 
 done:
-    filesystem_update_atime(current->p->fs, f->n);
+    filesystem_update_atime(current->p->fs, file_get_meta(f));
     f->offset = read_sofar;
     if (r < 0 && written_sofar == 0)
         return -EINVAL;
@@ -1185,30 +1197,12 @@ sysreturn chdir(const char *path)
 sysreturn fchdir(int dirfd)
 {
     file f = resolve_fd(current->p, dirfd);
-    tuple children = table_find(f->n, sym(children));
+    tuple children = table_find(file_get_meta(f), sym(children));
     if (!children)
         return set_syscall_error(current, -ENOTDIR);
 
-    current->p->cwd = f->n;
+    current->p->cwd = file_get_meta(f);
     return set_syscall_return(current, 0);
-}
-
-closure_function(3, 1, void, truncate_complete,
-                 thread, t, file, f, fsfile, fsf,
-                 status, s)
-{
-    thread t = bound(t);
-    thread_log(current, "%s: status %v (%s)", __func__, s,
-            is_ok(s) ? "OK" : "NOTOK");
-    if (is_ok(s)) {
-        file f = bound(f);
-        if (f) {
-            f->length = fsfile_get_length(bound(fsf));
-        }
-    }
-    set_syscall_return(t, is_ok(s) ? 0 : -EIO);
-    file_op_maybe_wake(t);
-    closure_finish();
 }
 
 static sysreturn truncate_internal(file f, tuple t, long length)
@@ -1223,15 +1217,12 @@ static sysreturn truncate_internal(file f, tuple t, long length)
     if (!fsf) {
         return set_syscall_error(current, ENOENT);
     }
-    file_op_begin(current);
-    if (filesystem_truncate(current->p->fs, fsf, length,
-            closure(heap_general(get_kernel_heaps()), truncate_complete,
-            current, f, fsf))) {
-        /* Nothing to do. */
-        return 0;
+    truncate_file_maps(current->p, fsf, length);
+    if (!filesystem_truncate(current->p->fs, fsf, length)) {
+        f->length = fsfile_get_length(fsf);
+        filesystem_update_mtime(current->p->fs, t);
     }
-    filesystem_update_mtime(current->p->fs, t);
-    return file_op_maybe_sleep(current);
+    return set_syscall_return(current, 0);
 }
 
 sysreturn truncate(const char *path, long length)
@@ -1255,30 +1246,61 @@ sysreturn ftruncate(int fd, long length)
             (f->f.type != FDESC_TYPE_REGULAR)) {
         return set_syscall_error(current, EINVAL);
     }
-    return truncate_internal(f, f->n, length);
+    return truncate_internal(f, file_get_meta(f), length);
 }
 
-closure_function(2, 1, void, fsync_complete,
-                 thread, t, file, f,
+closure_function(4, 1, void, sync_complete,
+                 filesystem, fs, thread, t, pagecache_node, pn, boolean, fs_flushed,
                  status, s)
 {
     thread t = bound(t);
-    thread_log(current, "%s: status %v (%s)", __func__, s,
-            is_ok(s) ? "OK" : "NOTOK");
+    thread_log(current, "%s: status %v, fs_flushed %d", __func__, s, bound(fs_flushed));
+    if (is_ok(s) && !bound(fs_flushed)) {
+        bound(fs_flushed) = true;
+        if (bound(pn))
+            pagecache_sync_node(bound(pn), (status_handler)closure_self());
+        else
+            pagecache_sync_volume(filesystem_get_pagecache_volume(bound(fs)), (status_handler)closure_self());
+        return;
+    }
     set_syscall_return(t, is_ok(s) ? 0 : -EIO);
     file_op_maybe_wake(t);
     closure_finish();
 }
 
+sysreturn sync(void)
+{
+    file_op_begin(current);
+    filesystem_flush(current->p->fs, closure(heap_general(get_kernel_heaps()),
+                                             sync_complete, current->p->fs, current, 0, false));
+    return file_op_maybe_sleep(current);
+}
+
+sysreturn syncfs(int fd)
+{
+    /* Resolve to check validity of fd.
+       When multiple volume support is added, we could grab the fs from the fsfile... */
+    resolve_fd(current->p, fd);
+    return sync();
+}
+
 sysreturn fsync(int fd)
 {
-    file f = resolve_fd(current->p, fd);
-
-    file_op_begin(current);
-    filesystem_flush(current->p->fs, f->n,
-                     closure(heap_general(get_kernel_heaps()),
-                             fsync_complete, current, f));
-    return file_op_maybe_sleep(current);
+    fdesc f = resolve_fd(current->p, fd);
+    switch (f->type) {
+    case FDESC_TYPE_REGULAR:
+        assert(((file)f)->fsf);
+        file_op_begin(current);
+        filesystem_flush(current->p->fs,
+                         closure(heap_general(get_kernel_heaps()), sync_complete, current->p->fs,
+                                 current, fsfile_get_cachenode(((file)f)->fsf), false));
+        return file_op_maybe_sleep(current);
+    case FDESC_TYPE_DIRECTORY:
+    case FDESC_TYPE_SYMLINK:
+        return 0;
+    default:
+        return -EINVAL;
+    }
 }
 
 sysreturn fdatasync(int fd)
@@ -1379,7 +1401,7 @@ static sysreturn fstat(int fd, struct stat *s)
     case FDESC_TYPE_DIRECTORY:
     case FDESC_TYPE_SPECIAL:
     case FDESC_TYPE_SYMLINK:
-        n = ((file)f)->n;
+        n = file_get_meta((file)f);
         break;
     default:
         n = 0;
@@ -1506,6 +1528,11 @@ sysreturn getrlimit(int resource, struct rlimit *rlim)
         return -EFAULT;
 
     switch (resource) {
+    case RLIMIT_DATA:
+        /* not entirely accurate, but a reasonable approximation */
+        rlim->rlim_cur = rlim->rlim_max =
+                heap_total(&heap_physical(get_kernel_heaps())->h);
+        return 0;
     case RLIMIT_STACK:
         rlim->rlim_cur = 2*1024*1024;
         rlim->rlim_max = 2*1024*1024;
@@ -1647,23 +1674,6 @@ sysreturn readlinkat(int dirfd, const char *pathname, char *buf, u64 bufsiz)
     return readlink_internal(cwd, pathname, buf, bufsiz);
 }
 
-closure_function(1, 1, void, file_delete_complete,
-                 thread, t,
-                 status, s)
-{
-    thread t = bound(t);
-    thread_log(current, "%s: status %v (%s)", __func__, s,
-            is_ok(s) ? "OK" : "NOTOK");
-    if (is_ok(s)) {
-        set_syscall_return(t, 0);
-    }
-    else {
-        set_syscall_error(t, EIO);
-    }
-    file_op_maybe_wake(t);
-    closure_finish();
-}
-
 static sysreturn unlink_internal(tuple cwd, const char *pathname)
 {
     tuple n;
@@ -1676,11 +1686,8 @@ static sysreturn unlink_internal(tuple cwd, const char *pathname)
         return set_syscall_error(current, EISDIR);
     }
     filesystem_update_mtime(current->p->fs, parent);
-    file_op_begin(current);
-    filesystem_delete(current->p->fs, parent, lookup_sym(parent, n),
-            closure(heap_general(get_kernel_heaps()), file_delete_complete,
-            current));
-    return file_op_maybe_sleep(current);
+    filesystem_delete(current->p->fs, parent, lookup_sym(parent, n));
+    return set_syscall_return(current, 0);
 }
 
 static sysreturn rmdir_internal(tuple cwd, const char *pathname)
@@ -1705,11 +1712,8 @@ static sysreturn rmdir_internal(tuple cwd, const char *pathname)
         }
     }
     filesystem_update_mtime(current->p->fs, parent);
-    file_op_begin(current);
-    filesystem_delete(current->p->fs, parent, lookup_sym(parent, n),
-            closure(heap_general(get_kernel_heaps()), file_delete_complete,
-            current));
-    return file_op_maybe_sleep(current);
+    filesystem_delete(current->p->fs, parent, lookup_sym(parent, n));
+    return set_syscall_return(current, 0);
 }
 
 sysreturn unlink(const char *pathname)
@@ -1743,18 +1747,6 @@ sysreturn rmdir(const char *pathname)
         return -EFAULT;
     thread_log(current, "rmdir %s", pathname);
     return rmdir_internal(current->p->cwd, pathname);
-}
-
-closure_function(1, 1, void, file_rename_complete,
-                 thread, t,
-                 status, s)
-{
-    thread t = bound(t);
-    thread_log(current, "%s: status %v (%s)", __func__, s,
-            is_ok(s) ? "OK" : "NOTOK");
-    set_syscall_return(t, is_ok(s) ? 0 : -EIO);
-    file_op_maybe_wake(t);
-    closure_finish();
 }
 
 static sysreturn rename_internal(tuple oldwd, const char *oldpath, tuple newwd,
@@ -1801,12 +1793,9 @@ static sysreturn rename_internal(tuple oldwd, const char *oldpath, tuple newwd,
     }
     filesystem_update_mtime(current->p->fs, oldparent);
     filesystem_update_mtime(current->p->fs, newparent);
-    file_op_begin(current);
     filesystem_rename(current->p->fs, oldparent, lookup_sym(oldparent, old),
-            newparent, filename_from_path(newpath),
-            closure(heap_general(get_kernel_heaps()), file_rename_complete,
-            current));
-    return file_op_maybe_sleep(current);
+                      newparent, filename_from_path(newpath));
+    return set_syscall_return(current, 0);
 }
 
 sysreturn rename(const char *oldpath, const char *newpath)
@@ -1860,13 +1849,10 @@ sysreturn renameat2(int olddirfd, const char *oldpath, int newdirfd,
         }
         filesystem_update_mtime(current->p->fs, oldparent);
         filesystem_update_mtime(current->p->fs, newparent);
-        file_op_begin(current);
         filesystem_exchange(current->p->fs, oldparent,
-                lookup_sym(oldparent, old), newparent,
-                lookup_sym(newparent, new),
-                closure(heap_general(get_kernel_heaps()), file_rename_complete,
-                current));
-        return file_op_maybe_sleep(current);
+                            lookup_sym(oldparent, old), newparent,
+                            lookup_sym(newparent, new));
+        return set_syscall_return(current, 0);
     }
     else {
         if ((flags & RENAME_NOREPLACE) &&
@@ -1885,7 +1871,7 @@ sysreturn close(int fd)
 
     if (fetch_and_add(&f->refcnt, -1) == 1) {
         if (f->close)
-            return apply(f->close);
+            return apply(f->close, current, syscall_io_complete);
         msg_err("no close handler for fd %d\n", fd);
     }
 
@@ -1955,27 +1941,45 @@ sysreturn fcntl(int fd, int cmd, s64 arg)
     }
 }
 
-sysreturn ioctl(int fd, unsigned long request, ...)
+sysreturn ioctl_generic(fdesc f, unsigned long request, vlist ap)
 {
-    // checks if fd is valid
-    fdesc f = resolve_fd(current->p, fd);
-
-    if (f->ioctl) {
-        vlist args;
-        vstart(args, request);
-        sysreturn rv = apply(f->ioctl, request, args);
-        vend(args);
-        return set_syscall_return(current, rv);
-    }
     switch (request) {
-    case FIONBIO:
+    case FIONBIO: {
+        int *opt = varg(ap, int *);
+        if (!validate_user_memory(opt, sizeof(int), false))
+            return -EFAULT;
+        if (*opt) {
+            f->flags |= O_NONBLOCK;
+        }
+        else {
+            f->flags &= ~O_NONBLOCK;
+        }
+        return 0;
+    }
     case FIONCLEX:
     case FIOCLEX:
         return 0;
     default:
-        thread_log(current, "ioctl: fd %d, request %x - not implemented", fd, request);
-        return set_syscall_error(current, ENOSYS);
+        return -ENOSYS;
     }
+}
+
+sysreturn ioctl(int fd, unsigned long request, ...)
+{
+    thread_log(current, "ioctl: fd %d, request 0x%x", fd, request);
+
+    // checks if fd is valid
+    fdesc f = resolve_fd(current->p, fd);
+
+    vlist args;
+    sysreturn rv;
+    vstart(args, request);
+    if (f->ioctl)
+        rv = apply(f->ioctl, request, args);
+    else
+        rv = ioctl_generic(f, request, args);
+    vend(args);
+    return rv;
 }
 
 sysreturn syscall_ignore()
@@ -2001,7 +2005,12 @@ void exit(int code)
 
 sysreturn exit_group(int status)
 {
-    vm_exit(status);
+    thread t;
+    vector_foreach(current->p->threads, t) {
+        if (t)
+            exit_thread(t);
+    }
+    kernel_shutdown(status);
 }
 
 sysreturn pipe2(int fds[2], int flags)
@@ -2140,6 +2149,8 @@ void register_file_syscalls(struct syscall *map)
     register_syscall(map, ftruncate, ftruncate);
     register_syscall(map, fdatasync, fdatasync);
     register_syscall(map, fsync, fsync);
+    register_syscall(map, sync, sync);
+    register_syscall(map, syncfs, syncfs);
     register_syscall(map, io_setup, io_setup);
     register_syscall(map, io_submit, io_submit);
     register_syscall(map, io_getevents, io_getevents);
@@ -2201,6 +2212,9 @@ void register_file_syscalls(struct syscall *map)
     register_syscall(map, umask, umask);
     register_syscall(map, statfs, statfs);
     register_syscall(map, fstatfs, fstatfs);
+    register_syscall(map, io_uring_setup, io_uring_setup);
+    register_syscall(map, io_uring_enter, io_uring_enter);
+    register_syscall(map, io_uring_register, io_uring_register);
 }
 
 #define SYSCALL_F_NOTRACE 0x1
@@ -2277,6 +2291,11 @@ closure_function(0, 2, void, syscall_io_complete_cfn,
     file_op_maybe_wake(t);
 }
 
+closure_function(0, 2, void, io_complete_ignore,
+                 thread, t, sysreturn, rv)
+{
+}
+
 // some validation can be moved up here
 static void syscall_schedule(context f, u64 call)
 {
@@ -2298,6 +2317,7 @@ void init_syscalls()
     heap h = heap_general(get_kernel_heaps());
     syscall = syscall_schedule;
     syscall_io_complete = closure(h, syscall_io_complete_cfn);
+    io_completion_ignore = closure(h, io_complete_ignore);
 }
 
 void _register_syscall(struct syscall *m, int n, sysreturn (*f)(), const char *name)

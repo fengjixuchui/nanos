@@ -119,7 +119,7 @@ closure_function(1, 6, sysreturn, unixsock_read,
 {
     unixsock s = bound(s);
     if ((s->sock.type == SOCK_STREAM) && (length == 0)) {
-        return 0;
+        return io_complete(completion, t, 0);
     }
 
     blockq_action ba = closure(s->sock.h, unixsock_read_bh, s, t, dest, length,
@@ -194,10 +194,10 @@ closure_function(1, 6, sysreturn, unixsock_write,
 {
     unixsock s = bound(s);
     if ((s->sock.type == SOCK_STREAM) && (length == 0)) {
-        return 0;
+        return io_complete(completion, t, 0);
     }
     if ((s->sock.type == SOCK_DGRAM) && (length > UNIXSOCK_BUF_MAX_SIZE)) {
-        return -EMSGSIZE;
+        return io_complete(completion, t, -EMSGSIZE);
     }
 
     blockq_action ba = closure(s->sock.h, unixsock_write_bh, s, t, src, length,
@@ -243,8 +243,9 @@ closure_function(1, 2, sysreturn, unixsock_ioctl,
     return socket_ioctl(&s->sock, request, ap);
 }
 
-closure_function(1, 0, sysreturn, unixsock_close,
-                 unixsock, s)
+closure_function(1, 2, sysreturn, unixsock_close,
+                 unixsock, s,
+                 thread, t, io_completion, completion)
 {
     unixsock s = bound(s);
     if (s->peer) {
@@ -266,7 +267,7 @@ closure_function(1, 0, sysreturn, unixsock_close,
         buffer_clear(table_find(s->fs_entry, sym(socket)));
     }
     unixsock_dealloc(s);
-    return 0;
+    return io_complete(completion, t, 0);
 }
 
 static sysreturn unixsock_bind(struct sock *sock, struct sockaddr *addr,
@@ -504,7 +505,7 @@ static unixsock unixsock_alloc(heap h, int type, u32 flags)
         msg_err("failed to allocate data buffer\n");
         goto err_queue;
     }
-    if (socket_init(current->p, h, type, flags, &s->sock) < 0) {
+    if (socket_init(current->p, h, AF_UNIX, type, flags, &s->sock) < 0) {
         msg_err("failed to initialize socket\n");
         goto err_socket;
     }

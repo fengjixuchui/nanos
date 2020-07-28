@@ -89,7 +89,7 @@ test test-noaccel: mkfs boot stage3
 	$(Q) $(MAKE) -C test test
 	$(Q) $(MAKE) runtime-tests$(subst test,,$@)
 
-RUNTIME_TESTS=	aio creat epoll eventfd fallocate fcntl fst getdents getrandom hw hws mkdir mmap pipe readv rename sendfile signal socketpair time unlink thread_test vsyscall write writev
+RUNTIME_TESTS=	aio creat dup epoll eventfd fallocate fcntl fst getdents getrandom hw hws io_uring mkdir mmap pipe readv rename sendfile signal socketpair time unlink thread_test vsyscall write writev
 
 .PHONY: runtime-tests runtime-tests-noaccel
 
@@ -127,6 +127,8 @@ QEMU_SERIAL=	-serial stdio
 QEMU_STORAGE=	-drive if=none,id=hd0,format=raw,file=$(IMAGE)
 ifeq ($(STORAGE),virtio-scsi)
 QEMU_STORAGE+=	-device virtio-scsi-pci$(STORAGE_BUS),id=scsi0 -device scsi-hd,bus=scsi0.0,drive=hd0
+else ifeq ($(STORAGE),pvscsi)
+QEMU_STORAGE+=	-device pvscsi$(STORAGE_BUS),id=scsi0 -device scsi-hd,bus=scsi0.0,drive=hd0
 else ifeq ($(STORAGE),virtio-blk)
 QEMU_STORAGE+=	-device virtio-blk-pci$(STORAGE_BUS),drive=hd0
 else ifeq ($(STORAGE),ide)
@@ -165,7 +167,7 @@ run-noaccel: image
 CLEANFILES+=	$(IMAGE:.raw=.vmdk)
 
 vmdk-image: image
-	$(Q) $(QEMU_IMG) convert -f raw -O vmdk -o subformat=streamOptimized $(IMAGE) $(IMAGE:.raw=.vmdk)
+	$(Q) $(QEMU_IMG) convert -f raw -O vmdk -o subformat=monolithicFlat $(IMAGE) $(IMAGE:.raw=.vmdk)
 
 ##############################################################################
 # GCE

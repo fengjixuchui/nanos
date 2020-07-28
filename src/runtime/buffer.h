@@ -82,25 +82,28 @@ static inline bytes buffer_set_capacity(buffer b, bytes len)
     return len;
 }
 
-static inline void buffer_extend(buffer b, bytes len)
+static inline boolean buffer_extend(buffer b, bytes len)
 {
     // xxx - pad to pagesize
     if (b->length < (b->end + len)) {
         bytes new_len = 2 * (b->end - b->start + len);
-        assert(buffer_set_capacity(b, new_len) == new_len);
+        return (buffer_set_capacity(b, new_len) == new_len);
     }
+    return true;
 }
 
-static inline void extend_total(buffer b, int offset)
+static inline boolean extend_total(buffer b, int offset)
 {
     if (offset > b->end) {
-        buffer_extend(b, offset - b->end);
+        if (!buffer_extend(b, offset - b->end))
+            return false;
         // shouldn't need to in all cases - this is to preserve
         // the idea of the vector as a mapping - we need a reliable
         // sigleton to denote an empty slot
         zero(b->contents + b->end, offset - b->end);
         b->end = offset;
     }
+    return true;
 }
 
 static inline buffer wrap_buffer(heap h,
@@ -288,6 +291,36 @@ static inline boolean buffer_compare_with_cstring(buffer b, const char *x)
             return i == len - 1;
     }
     return x[len] == '\0';
+}
+
+static inline int buffer_memcmp(buffer b, void *mem, bytes n)
+{
+    bytes len = buffer_length(b);
+    int ret = runtime_memcmp(buffer_ref(b, 0), mem, MIN(len, n));
+    if (ret)
+        return ret;
+    else if (len < n)
+        return -1;
+    else
+        return 0;
+}
+
+/* Can only be used with literal strings. */
+#define buffer_strcmp(b, str)   ({  \
+    int res = buffer_memcmp(b, str, sizeof(str) - 1);   \
+    if (!res && buffer_length(b) >= sizeof(str))    \
+        res = 1;    \
+    res;    \
+})
+
+static inline int buffer_strchr(buffer b, int c)
+{
+    bytes len = buffer_length(b);
+    for (bytes i = 0; i < len; i++) {
+        if (byte(b, i) == c)
+            return i;
+    }
+    return -1;
 }
 
 // the ascii subset..utf8 me

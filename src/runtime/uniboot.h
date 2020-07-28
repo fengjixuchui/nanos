@@ -1,10 +1,15 @@
 #include <predef.h>
 
+#define BOOTFS_SIZE (8 * MB)
+
 #define KMEM_BASE   0xffff800000000000ull
 #define KERNEL_BASE 0xffffffff80000000ull
 #define KMEM_LIMIT  0xffffffff00000000ull
 #define PAGES_BASE  0xffffffffc0000000ull
 #define USER_LIMIT  0x0000800000000000ull
+
+/* Physical address where kernel ELF is loaded in case of direct stage3 load */
+#define KERNEL_BASE_PHYS    0x00200000ul
 
 #ifdef BOOT
 
@@ -51,7 +56,7 @@ extern void * AP_BOOT_PAGE;
 #define STAGE2_WORKING_HEAP_SIZE (128 * MB)
 
 #define STAGE2_STACK_SIZE  (128 * KB)  /* stage2 stack is recycled, too */
-#define KERNEL_STACK_SIZE  (128 * KB)
+#define KERNEL_STACK_SIZE  (128 * KB)  /* must match value in crt0.s */
 #define EXCEPT_STACK_SIZE  (32 * KB)
 #define INT_STACK_SIZE     (32 * KB)
 #define BH_STACK_SIZE      (32 * KB)
@@ -72,6 +77,7 @@ extern void * AP_BOOT_PAGE;
 
 /* TFS stuff */
 #define TFS_LOG_DEFAULT_EXTENSION_SIZE (512*KB)
+#define TFS_LOG_FLUSH_DELAY_SECONDS 1
 
 /* Xen stuff */
 #define XENNET_INIT_RX_BUFFERS_FACTOR 4
@@ -79,7 +85,8 @@ extern void * AP_BOOT_PAGE;
 #define XENNET_TX_SERVICEQUEUE_DEPTH 512
 
 /* mm stuff */
-#define CACHE_DRAIN_CUTOFF (64 * MB)
+#define PAGECACHE_DRAIN_CUTOFF (64 * MB)
+#define PAGECACHE_SCAN_PERIOD_SECONDS 5
 
 #include <x86.h>
 void xsave(void *);

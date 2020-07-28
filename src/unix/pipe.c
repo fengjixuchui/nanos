@@ -130,11 +130,12 @@ static inline void pipe_dealloc_end(pipe p, pipe_file pf)
     }
 }
 
-closure_function(1, 0, sysreturn, pipe_close,
-                 pipe_file, pf)
+closure_function(1, 2, sysreturn, pipe_close,
+                 pipe_file, pf,
+                 thread, t, io_completion, completion)
 {
     pipe_dealloc_end(bound(pf)->pipe, bound(pf));
-    return 0;
+    return io_complete(completion, t, 0);
 }
 
 closure_function(5, 1, sysreturn, pipe_read_bh,
@@ -183,7 +184,7 @@ closure_function(1, 6, sysreturn, pipe_read,
     pipe_file pf = bound(pf);
 
     if (length == 0)
-        return 0;
+        return io_complete(completion, t, 0);
 
     blockq_action ba = closure(pf->pipe->h, pipe_read_bh, pf, t, dest, length,
                                completion);
@@ -238,7 +239,7 @@ closure_function(1, 6, sysreturn, pipe_write,
                  void *, dest, u64, length, u64, offset, thread, t, boolean, bh, io_completion, completion)
 {
     if (length == 0)
-        return 0;
+        return io_complete(completion, t, 0);
 
     pipe_file pf = bound(pf);
     blockq_action ba = closure(pf->pipe->h, pipe_write_bh, pf, t, dest, length,

@@ -202,12 +202,6 @@ closure_function(5, 1, sysreturn, timerfd_read_bh,
     timer_debug("fd %d, dest %p, length %ld, tid %d, flags 0x%lx\n",
                 ut->info.timerfd.fd, bound(dest), bound(length), t->tid, flags);
 
-    if (bound(length) < sizeof(u64)) {
-        assert(!blocked);
-        rv = -EINVAL;
-        goto out;
-    }
-
     if (flags & BLOCKQ_ACTION_NULLIFY) {
         assert(blocked);
         rv = -EINTR;
@@ -241,8 +235,8 @@ closure_function(1, 6, sysreturn, timerfd_read,
                  unix_timer, ut,
                  void *, dest, u64, length, u64, offset_arg, thread, t, boolean, bh, io_completion, completion)
 {
-    if (length == 0)
-        return 0;
+    if (length < sizeof(u64))
+        return io_complete(completion, t, -EINVAL);
     unix_timer ut = bound(ut);
     timer_debug("fd %d, dest %p, length %ld, tid %d, bh %d, completion %p\n", ut->info.timerfd.fd,
                 dest, length, t->tid, bh, completion);
@@ -257,8 +251,9 @@ closure_function(1, 1, u32, timerfd_events,
     return bound(ut)->overruns > 0 ? EPOLLIN : 0;
 }
 
-closure_function(1, 0, sysreturn, timerfd_close,
-                 unix_timer, ut)
+closure_function(1, 2, sysreturn, timerfd_close,
+                 unix_timer, ut,
+                 thread, t, io_completion, completion)
 {
     unix_timer ut = bound(ut);
     remove_unix_timer(ut);
@@ -268,7 +263,7 @@ closure_function(1, 0, sysreturn, timerfd_close,
     deallocate_closure(ut->f.close);
     release_fdesc(&ut->f);
     deallocate_unix_timer(ut);
-    return 0;
+    return io_complete(completion, t, 0);
 }
 
 sysreturn timerfd_create(int clockid, int flags)

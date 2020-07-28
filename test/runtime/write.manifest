@@ -1,6 +1,10 @@
 (
+    boot:(
+        children:(
+            kernel:(contents:(host:output/stage3/bin/stage3.img))
+        )
+    )
     children:(
-    	      kernel:(contents:(host:output/stage3/bin/stage3.img))
               write:(contents:(host:output/test/runtime/bin/write))
               hello:(contents:(host:test/runtime/write_contents/hello))
 	      )
@@ -9,6 +13,7 @@
 #    debugsyscalls:t
 #    futex_trace:t
     fault:t
-    arguments:[/]
+#    arguments:[write -p]
     environment:(USER:bobby PWD:/)
+    imagesize:30M
 )

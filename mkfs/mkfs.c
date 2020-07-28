@@ -6,12 +6,14 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <sys/mman.h>
+#include <pagecache.h>
 #include <tfs.h>
 #include <dirent.h>
 #include <errno.h>
 #include <limits.h>
 
 #include <region.h>
+#include <storage.h>
 
 static buffer read_stdin(heap h)
 {
@@ -190,10 +192,21 @@ static value translate(heap h, vector worklist,
 
 extern heap init_process_runtime();
 
-closure_function(3, 2, void, fsc,
-                 heap, h, descriptor, out, const char *, target_root,
+static io_status_handler mkfs_write_status;
+closure_function(0, 2, void, mkfs_write_handler,
+                 status, s, bytes, length)
+{
+    if (!is_ok(s)) {
+        rprintf("write failed with %v\n", s);
+        exit(1);
+    }
+}
+
+closure_function(4, 2, void, fsc,
+                 heap, h, descriptor, out, tuple, root, const char *, target_root,
                  filesystem, fs, status, s)
 {
+    tuple root = bound(root);
     if (!root)
         exit(1);
 
@@ -208,46 +221,29 @@ closure_function(3, 2, void, fsc,
     deallocate_buffer(b);
     rprintf("\n");
 
-    filesystem_write_tuple(fs, md, ignore_status);
+    filesystem_write_tuple(fs, md);
     vector i;
+    buffer off = 0;
     vector_foreach(worklist, i) {
-        tuple f = vector_get(i, 0);        
+        tuple f = vector_get(i, 0);
         buffer contents = get_file_contents(h, bound(target_root), vector_get(i, 1));
         if (contents) {
-            allocate_fsfile(fs, f);
-            filesystem_write(fs, f, contents, 0, ignore_io_status);
-            deallocate_buffer(contents);
+            if (buffer_length(contents) > 0) {
+                fsfile fsf = allocate_fsfile(fs, f);
+                filesystem_write_linear(fsf, buffer_ref(contents, 0), irangel(0, buffer_length(contents)),
+                                        ignore_io_status);
+                deallocate_buffer(contents);
+            } else {
+                if (!off)
+                    off = wrap_buffer_cstring(h, "0");
+                /* make an empty file */
+                filesystem_write_eav(fs, f, sym(extents), allocate_tuple());
+                filesystem_write_eav(fs, f, sym(filelength), off);
+            }
         }
     }
-}
-
-struct partition_entry {
-    u8 active;
-    u8 chs_start[3];
-    u8 type;
-    u8 chs_end[3];
-    u32 lba_start;
-    u32 nsectors;
-} __attribute__((packed));
-
-#define SEC_PER_TRACK 63
-#define HEADS 255
-#define MAX_CYL 1023
-
-static void mbr_chs(u8 *chs, u64 offset)
-{
-    u64 cyl = ((offset / SECTOR_SIZE) / SEC_PER_TRACK) / HEADS;
-    u64 head = ((offset / SECTOR_SIZE) / SEC_PER_TRACK) % HEADS;
-    u64 sec = ((offset / SECTOR_SIZE) % SEC_PER_TRACK) + 1;
-    if (cyl > MAX_CYL) {
-        cyl = MAX_CYL;
-	head = 254;
-	sec = 63;
-    }
-
-    chs[0] = head;
-    chs[1] = (cyl >> 8) | sec;
-    chs[2] = cyl & 0xff;
+    filesystem_flush(fs, ignore_status);
+    closure_finish();
 }
 
 static void write_mbr(descriptor f)
@@ -266,13 +262,10 @@ static void write_mbr(descriptor f)
     else if (res != sizeof(buf))
         halt("could not read MBR (short read)\n");
 
-    // MBR signature
-    u16 *mbr_sig = (u16 *) (buf + sizeof(buf) - sizeof(*mbr_sig));
-    if (*mbr_sig != 0xaa55)
-        halt("invalid MBR signature\n");
-
     // first MBR partition entry
-    struct partition_entry *e = (struct partition_entry *) ((char *) mbr_sig - 4 * sizeof(*e));
+    struct partition_entry *e = partition_get(buf, 0);
+    if (!e)
+        halt("invalid MBR signature\n");
 
     // FS region comes right before MBR partitions (see boot/stage1.s)
     region r = (region) ((char *) e - sizeof(*r));
@@ -280,15 +273,14 @@ static void write_mbr(descriptor f)
         halt("invalid boot record (missing filesystem region) \n");
     u64 fs_offset = SECTOR_SIZE + r->length;
     assert(fs_offset % SECTOR_SIZE == 0);
-    assert(total_size > fs_offset);
+    u64 fs_size = BOOTFS_SIZE;
+    partition_write(&e[PARTITION_BOOTFS], true, 0x83, fs_offset, fs_size);
 
-    // create partition entry
-    e->active = 0x80;      // active, bootable
-    e->type = 0x83;        // any Linux filesystem
-    mbr_chs(e->chs_start, fs_offset);
-    mbr_chs(e->chs_end, total_size - SECTOR_SIZE);
-    e->lba_start = fs_offset / SECTOR_SIZE;
-    e->nsectors = (total_size - fs_offset) / SECTOR_SIZE;
+    /* Root filesystem */
+    fs_offset += fs_size;
+    assert(total_size > fs_offset);
+    partition_write(&e[PARTITION_ROOTFS], true, 0x83, fs_offset,
+                    total_size - fs_offset);
 
     // write MBR
     res = pwrite(f, buf, sizeof(buf), 0);
@@ -313,6 +305,35 @@ static void usage(const char *program_name)
            p);
 }
 
+boolean parse_size(const char *str, long long *size)
+{
+    char *endptr;
+    long long img_size = strtoll(str, &endptr, 0);
+    if (img_size <= 0)
+        return false;
+    switch (*endptr) {
+    case 'k':
+    case 'K':
+        img_size *= KB;
+        break;
+    case 'm':
+    case 'M':
+        img_size *= MB;
+        break;
+    case 'g':
+    case 'G':
+        img_size *= GB;
+        break;
+    case '\0':
+        break;
+    default:
+        return false;
+    }
+    img_size = pad(img_size, SECTOR_SIZE);
+    *size = img_size;
+    return true;
+}
+
 int main(int argc, char **argv)
 {
     int c;
@@ -329,34 +350,11 @@ int main(int argc, char **argv)
             target_root = optarg;
             break;
         case 's': {
-            char *endptr;
-            img_size = strtoll(optarg, &endptr, 0);
-            if (img_size <= 0) {
-                printf("invalid image file size %lld\n", img_size);
+            if (!parse_size(optarg, &img_size)) {
+                printf("invalid image file size %s\n", optarg);
                 usage(argv[0]);
                 exit(1);
             }
-            switch (*endptr) {
-            case 'k':
-            case 'K':
-                img_size *= KB;
-                break;
-            case 'm':
-            case 'M':
-                img_size *= MB;
-                break;
-            case 'g':
-            case 'G':
-                img_size *= GB;
-                break;
-            case '\0':
-                break;
-            default:
-                printf("invalid image file size suffix '%s'\n", endptr);
-                usage(argv[0]);
-                exit(1);
-            }
-            img_size = pad(img_size, SECTOR_SIZE);
             break;
         }
         default:
@@ -401,20 +399,67 @@ int main(int argc, char **argv)
         }
     }
 
+    if (offset >= (1 << 16)) {
+        halt("boot image size (%d) exceeds 64KB; either trim stage2 or "
+             "update readsectors in stage1\n", offset);
+    }
+
     parser p = tuple_parser(h, closure(h, finish, h), closure(h, perr));
     // this can be streaming
     parser_feed (p, read_stdin(h));
-    // fixing the size doesn't make sense in this context?
+
+    mkfs_write_status = closure(h, mkfs_write_handler);
+
+    if (root) {
+        value v = table_find(root, sym(imagesize));
+        if (v && tagof(v) != tag_tuple) {
+            table_set(root, sym(imagesize), 0); /* consume it, kernel doesn't need it */
+            push_u8((buffer)v, 0);
+            char *s = buffer_ref((buffer)v, 0);
+            if (!parse_size(s, &img_size)) {
+                halt("invalid imagesize string \"%s\"\n", s);
+            }
+            deallocate_buffer((buffer)v);
+        }
+
+        tuple boot = table_find(root, sym(boot));
+        if (!boot) {
+            /* Look for kernel file in root filesystem, for backward
+             * compatibility. */
+            tuple c = children(root);
+            assert(c);
+            tuple kernel = table_find(c, sym(kernel));
+            if (kernel) {
+                boot = allocate_tuple();
+                c = allocate_tuple();
+                table_set(boot, sym(children), c);
+                table_set(c, sym(kernel), kernel);
+            }
+        }
+        if (!boot)
+            halt("boot FS not found\n");
+        pagecache pc = allocate_pagecache(h, h, 0, PAGESIZE);
+        assert(pc != INVALID_ADDRESS);
+        create_filesystem(h, SECTOR_SIZE, BOOTFS_SIZE, 0,
+                          closure(h, bwrite, out, offset), pc, allocate_tuple(),
+                          true, closure(h, fsc, h, out, boot, target_root));
+        offset += BOOTFS_SIZE;
+
+        /* Remove tuple from root, so it doesn't end up in the root FS. */
+        table_set(root, sym(boot), 0);
+    }
+
+    pagecache pc = allocate_pagecache(h, h, 0, PAGESIZE);
+    assert(pc != INVALID_ADDRESS);
     create_filesystem(h,
                       SECTOR_SIZE,
-                      SECTOR_SIZE,
                       infinity,
-                      h,
                       0, /* no read -> new fs */
                       closure(h, bwrite, out, offset),
+                      pc,
                       allocate_tuple(),
                       true,
-                      closure(h, fsc, h, out, target_root));
+                      closure(h, fsc, h, out, root, target_root));
 
     if (img_size > 0) {
         off_t current_size = lseek(out, 0, SEEK_END);

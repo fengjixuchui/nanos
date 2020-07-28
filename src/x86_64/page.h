@@ -12,6 +12,7 @@
 #define PAGE_PRESENT       0x0001
 
 #define PAGEMASK           MASK(PAGELOG)
+#define PAGEMASK_2M        MASK(PAGELOG_2M)
 #define PAGE_FLAGS_MASK    (PAGE_NO_EXEC | PAGEMASK)
 #define PAGE_PROT_FLAGS    (PAGE_NO_EXEC | PAGE_USER | PAGE_WRITABLE)
 #define PAGE_DEV_FLAGS     (PAGE_WRITABLE | PAGE_CACHE_DISABLE | PAGE_NO_EXEC)
@@ -29,6 +30,17 @@ static inline boolean pt_entry_is_fat(int level, u64 entry)
 static inline boolean pt_entry_is_pte(int level, u64 entry)
 {
     return level == 4 || pt_entry_is_fat(level, entry);
+}
+
+static inline boolean pt_entry_is_dirty(u64 entry)
+{
+    return (entry & PAGE_DIRTY) != 0;
+}
+
+static inline u64 page_from_pte(u64 pte)
+{
+    /* page directory pointer base address [51:12] */
+    return pte & (MASK(52) & ~PAGEMASK);
 }
 
 #ifndef physical_from_virtual
@@ -57,7 +69,10 @@ boolean traverse_ptes(u64 vaddr, u64 length, entry_handler eh);
 void page_invalidate(u64 p, thunk completion);
 void flush_tlb();
 void init_flush();
+void *bootstrap_page_tables(heap initial);
 #ifdef STAGE3
+void map_setup_2mbpages(u64 v, physical p, int pages, u64 flags,
+                        u64 *pdpt, u64 *pdt);
 id_heap init_page_tables(heap h, id_heap physical, range initial_map);
 #else
 void init_page_tables(heap initial);

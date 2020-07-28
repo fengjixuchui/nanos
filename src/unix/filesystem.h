@@ -4,8 +4,9 @@
     else if (__dirfd == AT_FDCWD) cwd = current->p->cwd; \
     else { \
         file f = resolve_fd(current->p, __dirfd); \
-        if (!is_dir(f->n)) return set_syscall_error(current, ENOTDIR); \
-        cwd = f->n; \
+        tuple t = file_get_meta(f); \
+        if (!is_dir(t)) return set_syscall_error(current, ENOTDIR); \
+        cwd = t; \
     } \
     cwd; \
 })
@@ -41,9 +42,14 @@ static inline symbol lookup_sym(tuple parent, tuple t)
     return false;
 }
 
+static inline char *path_find_last_delim(const char *path, unsigned int len)
+{
+    return (char *)utf8_findn_r((u8 *)path, len, '/');
+}
+
 static inline const char *filename_from_path(const char *path)
 {
-    const char *filename = (char *) utf8_find_r((u8 *) path, '/');
+    const char *filename = path_find_last_delim(path, PATH_MAX);
     if (!filename) {
         filename = path;
     } else {
@@ -51,6 +57,38 @@ static inline const char *filename_from_path(const char *path)
     }
     return filename;
 }
+
+/* Expects an empty buffer, and never resizes the buffer. */
+static inline boolean dirname_from_path(buffer dest, const char *path)
+{
+    int pathlen = runtime_strlen(path);
+    const char *last_delim = path_find_last_delim(path, PATH_MAX);
+    const char *dirname;
+    int len;
+    if (!last_delim) {
+        dirname = path;
+        len = pathlen;
+    } else if (last_delim < path + pathlen - 1) {
+        dirname = last_delim + 1;
+        len = pathlen - (dirname - path);
+    } else {    /* The path ends with '/'. */
+        const char *delim = path_find_last_delim(path, last_delim - path);
+        if (!delim) {
+            dirname = path;
+            len = pathlen - 1;
+        } else {
+            dirname = delim + 1;
+            len = last_delim - dirname;
+        }
+    }
+    if (len >= dest->length)
+        return false;
+    buffer_write(dest, dirname, len);
+    push_u8(dest, '\0');
+    return true;
+}
+
+sysreturn sysreturn_from_fs_status_value(status s);
 
 int resolve_cstring(tuple cwd, const char *f, tuple *entry, tuple *parent);
 

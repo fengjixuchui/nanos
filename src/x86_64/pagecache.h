@@ -1,69 +1,51 @@
-/* cache index to volume index, in bytes */
-typedef closure_type(block_mapper, u64, u64);
+typedef struct pagecache *pagecache;
 
-struct pagelist {
-    struct list l;
-    u64 pages;
-};
+typedef struct pagecache_volume *pagecache_volume;
 
-typedef struct pagecache {
-    int page_order;
-    int block_order;
-    struct spinlock lock;
-    rangemap pages;
-    struct pagelist free;      /* see state descriptions */
-    struct pagelist new;
-    struct pagelist active;
-    struct pagelist dirty;     /* phase 2 */
-    u64 total_pages;
-    u64 length;                 /* hard limit */
-    heap h;
-    heap backed;
-    block_mapper mapper;
-    block_io block_read;
-    block_io block_write;
-    sg_block_io sg_read;
-    block_io write;
-} *pagecache;
+typedef struct pagecache_node *pagecache_node;
 
-#define PAGECACHE_PAGESTATE_SHIFT   61
+void pagecache_set_node_length(pagecache_node pn, u64 length);
 
-#define PAGECACHE_PAGESTATE_FREE    0 /* unused, yet may remain in search tree and retain usage stats */
-#define PAGECACHE_PAGESTATE_EVICTED 1 /* evicted, awaiting release by user (not on list) */
-#define PAGECACHE_PAGESTATE_ALLOC   2 /* allocated, request not issued (not on list) */
-#define PAGECACHE_PAGESTATE_READING 3 /* block reads issued (not on list) */
-#define PAGECACHE_PAGESTATE_NEW     4 /* newly-loaded and full page writes - can be reclaimed */
-#define PAGECACHE_PAGESTATE_ACTIVE  5 /* cache hit for page */
-#define PAGECACHE_PAGESTATE_DIRTY   6 /* page not synced */
-#define PAGECACHE_PAGESTATE_WRITING 7 /* block writes in progress; back to tail of new on completion */
+u64 pagecache_get_node_length(pagecache_node pn);
 
-/* TODO fix for block size > pagesize */
-typedef struct pagecache_page {
-    struct rmnode node;
-    struct refcount refcount;
-    struct list l;
-    struct spinlock lock;       /* cover changes to state / completions */
-    void *kvirt;
-    u64 state_phys;             /* state and physical page number */
-    vector completions;         /* status_handlers */
-} *pagecache_page;
+void pagecache_node_finish_pending_writes(pagecache_node pn, status_handler complete);
 
-static inline void pagecache_release_page(pagecache_page pp)
-{
-    refcount_release(&pp->refcount);
-}
+void pagecache_sync_node(pagecache_node pn, status_handler complete);
 
-static inline sg_block_io pagecache_reader_sg(pagecache pc)
-{
-    return pc->sg_read;
-}
+void pagecache_sync_volume(pagecache_volume pv, status_handler complete);
 
-static inline block_io pagecache_writer(pagecache pc)
-{
-    return pc->write;
-}
+void *pagecache_get_zero_page(pagecache pc);
+
+int pagecache_get_page_order(pagecache pc);
 
 u64 pagecache_drain(pagecache pc, u64 drain_bytes);
-pagecache allocate_pagecache(heap general, heap backed,
-                             u64 length, u64 pagesize, u64 block_size,
-                             block_mapper mapper, block_io read, block_io write);
+
+pagecache_node pagecache_allocate_node(pagecache_volume pv, sg_io fs_read, sg_io fs_write);
+
+void pagecache_deallocate_node(pagecache_node pn);
+
+sg_io pagecache_node_get_reader(pagecache_node pn);
+
+sg_io pagecache_node_get_writer(pagecache_node pn);
+
+void pagecache_map_page(pagecache_node pn, u64 node_offset, u64 vaddr, u64 flags,
+                        status_handler complete);
+
+boolean pagecache_map_page_if_filled(pagecache_node pn, u64 node_offset, u64 vaddr, u64 flags);
+
+boolean pagecache_node_do_page_cow(pagecache_node pn, u64 node_offset, u64 vaddr, u64 flags);
+
+void pagecache_node_scan_and_commit_shared_pages(pagecache_node pn, range q /* bytes */);
+
+void pagecache_node_close_shared_pages(pagecache_node pn, range q /* bytes */);
+
+void pagecache_node_unmap_pages(pagecache_node pn, range v /* bytes */, u64 node_offset);
+
+void pagecache_node_add_shared_map(pagecache_node pn , range v /* bytes */, u64 node_offset);
+
+pagecache_volume pagecache_allocate_volume(pagecache pc, u64 length, int block_order);
+void pagecache_dealloc_volume(pagecache_volume pv);
+
+pagecache allocate_pagecache(heap general, heap contiguous, heap physical, u64 pagesize);
+
+void deallocate_pagecache(pagecache pc);

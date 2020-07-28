@@ -143,6 +143,7 @@ bios_read_sectors:
 	push ebx
 	push esi
 	push edi
+	pushfd
 
 	; prepare dap
 	mov eax, [ebp + 8]
@@ -275,6 +276,7 @@ bios_read_sectors:
 
 	ENTER_PROTECTED
 
+	popfd
 	pop edi
 	pop esi
 	pop ebx
@@ -292,6 +294,7 @@ bios_tty_write:
 	push ebx
 	push esi
 	push edi
+	pushfd
 
 	; get arguments
 	mov esi, [ebp + 8]
@@ -319,6 +322,7 @@ bios_tty_write:
 	jnz .loop
 	ENTER_PROTECTED
 
+	popfd
 	pop edi
 	pop esi
 	pop ebx
@@ -336,14 +340,13 @@ bios_tty_write:
 global run64        
 run64:
         mov eax, cr4     
-        or eax, CR4_PAE | CR4_OSFXSR | CR4_OSXMMEXCPT | CR4_OSXSAVE
+        or eax, CR4_PAE
         mov cr4, eax  
 
         mov ecx, 0xC0000080 ; EFER MSR.
         
         rdmsr      
         or eax, 1 << 8      ; Set the LM-bit which is the 9th bit (bit 8).
-        or eax, 1 << 11     ; NXE - enable no exec flag in page tables
         wrmsr
 
         pop edx                 ; return
@@ -354,7 +357,6 @@ run64:
 
         mov eax, cr0    
         or eax, 1 << 31 | 1 ; Set the PG-bit and the PM bit 
-        and eax, ~4 ; clear the EM bit
         mov cr0, eax
         
         ;; 64 bit compatibility into the proper long mode

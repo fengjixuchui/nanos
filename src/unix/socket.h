@@ -3,6 +3,11 @@ struct sockaddr {
     u8 sa_data[14];
 } *sockaddr;
 
+struct sockaddr_storage {
+    u16 family;
+    u8 ss_data[126];
+};
+
 typedef u32 socklen_t;
 
 struct sock {
@@ -28,7 +33,7 @@ struct sock {
     sysreturn (*shutdown)(struct sock *sock, int how);
 };
 
-static inline int socket_init(process p, heap h, int type, u32 flags,
+static inline int socket_init(process p, heap h, int domain, int type, u32 flags,
         struct sock *s)
 {
     runtime_memset((u8 *) s, 0, sizeof(*s));
@@ -49,6 +54,7 @@ static inline int socket_init(process p, heap h, int type, u32 flags,
     }
     init_fdesc(h, &s->f, FDESC_TYPE_SOCKET);
     s->f.flags = flags;
+    s->domain = domain;
     s->type = type;
     s->h = h;
     return s->fd;
@@ -77,22 +83,7 @@ static inline void socket_flush_q(struct sock *s)
 static inline sysreturn socket_ioctl(struct sock *s, unsigned long request,
         vlist ap)
 {
-    switch (request) {
-    case FIONBIO: {
-        int *opt = varg(ap, int *);
-        if (!validate_user_memory(opt, sizeof(int), false))
-            return -EFAULT;
-        if (*opt) {
-            s->f.flags |= SOCK_NONBLOCK;
-        }
-        else {
-            s->f.flags &= ~SOCK_NONBLOCK;
-        }
-        return 0;
-    }
-    default:
-        return -ENOSYS;
-    }
+    return ioctl_generic(&s->f, request, ap);
 }
 
 sysreturn unixsock_open(int type, int protocol);
