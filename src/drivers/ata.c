@@ -81,6 +81,7 @@ struct ata {
     u16 capabilities;
     u32 command_sets;
     u64 capacity;
+    boolean irq_enabled;
 };
 
 static inline u8 ata_in8(struct ata *dev, int reg)
@@ -192,38 +193,16 @@ static int ata_io_loop(struct ata *dev, int cmd, void *buf, u64 nsectors)
     }
 }
 
-void ata_io_cmd(void * _dev, int cmd, void * buf, range blocks, status_handler s)
+static boolean ata_set_lba(struct ata *dev, u64 lba, u64 nsectors)
 {
-    struct ata *dev = (struct ata *)_dev;
-    const char *err;
+    // wait for device to become ready
+    if (ata_wait(dev, 0) < 0)
+        return false;
 
-    u64 lba = blocks.start;
-    u64 nsectors = range_span(blocks);
-    if (nsectors == 0) {
-        const char *err = "ata_io_cmd: zero blocks I/O";
-        apply(s, timm("result", "%s", err));
-        return;
-    }
     if (dev->command_sets & ATA_CS_LBA48) {
         assert(nsectors <= 65536);
         if (nsectors == 65536)
             nsectors = 0;
-    } else {
-        assert(nsectors <= 255);
-        if (cmd == ATA_READ48)
-            cmd = ATA_READ;
-        else if (cmd == ATA_WRITE48)
-            cmd = ATA_WRITE;
-    }
-    ata_debug("%s: cmd 0x%x, blocks %R, sectors %d\n",
-        __func__, cmd, blocks, nsectors);
-
-    // wait for device to become ready
-    if (ata_wait(dev, 0) < 0)
-        goto timeout;
-
-    // set LBA
-    if (dev->command_sets & ATA_CS_LBA48) {
         ata_out8(dev, ATA_COUNT, nsectors >> 8);
         ata_out8(dev, ATA_COUNT, nsectors);
         ata_out8(dev, ATA_CYL_MSB, lba >> 40);
@@ -234,12 +213,42 @@ void ata_io_cmd(void * _dev, int cmd, void * buf, range blocks, status_handler s
         ata_out8(dev, ATA_SECTOR, lba);
         ata_out8(dev, ATA_DRIVE, ATA_D_LBA | ATA_DEV(dev->unit));
     } else {
+        assert(nsectors <= 255);
         ata_out8(dev, ATA_COUNT, nsectors);
         ata_out8(dev, ATA_CYL_MSB, lba >> 16);
         ata_out8(dev, ATA_CYL_LSB, lba >> 8);
         ata_out8(dev, ATA_SECTOR, lba);
         ata_out8(dev, ATA_DRIVE, ATA_D_IBM | ATA_D_LBA | ATA_DEV(dev->unit) | ((lba >> 24) & 0x0f));
     }
+    return true;
+}
+
+void ata_io_cmd(void * _dev, int cmd, void * buf, range blocks, status_handler s)
+{
+    struct ata *dev = (struct ata *)_dev;
+    const char *err;
+
+    u64 lba = blocks.start;
+    u64 nsectors = range_span(blocks);
+    if (nsectors == 0) {
+        apply(s, timm("result", "ata_io_cmd: zero blocks I/O"));
+        return;
+    }
+    if (!(dev->command_sets & ATA_CS_LBA48)) {
+        if (cmd == ATA_READ48)
+            cmd = ATA_READ;
+        else if (cmd == ATA_WRITE48)
+            cmd = ATA_WRITE;
+    }
+    ata_debug("%s: cmd 0x%x, blocks %R, sectors %d\n",
+        __func__, cmd, blocks, nsectors);
+
+    if (dev->irq_enabled) {
+        ata_out8(dev, ATA_CONTROL, ATA_A_IDS);
+        dev->irq_enabled = false;
+    }
+    if (!ata_set_lba(dev, lba, nsectors))
+        goto timeout;
 
     // send I/O command
     ata_out8(dev, ATA_COMMAND, cmd);
@@ -255,7 +264,33 @@ void ata_io_cmd(void * _dev, int cmd, void * buf, range blocks, status_handler s
 timeout:
     err = "ata_io_cmd: device timeout";
     msg_err("%s\n", err);
-    apply(s, timm("result", "%s", err));
+    apply(s, timm("result", err));
+}
+
+boolean ata_io_cmd_dma(void *_dev, boolean write, range blocks)
+{
+    ata_debug("%s: %s at %R\n", __func__, write ? "write" : "read", blocks);
+    struct ata *dev = (struct ata *)_dev;
+    if (!ata_set_lba(dev, blocks.start, range_span(blocks)))
+        return false;
+    u8 cmd;
+    if (dev->command_sets & ATA_CS_LBA48)
+        cmd = (write ? ATA_WRITE_DMA48 : ATA_READ_DMA48);
+    else
+        cmd = (write ? ATA_WRITE_DMA : ATA_READ_DMA);
+    ata_out8(dev, ATA_COMMAND, cmd);
+    if (!dev->irq_enabled) {
+        ata_out8(dev, ATA_CONTROL, 0);
+        dev->irq_enabled = true;
+    }
+    return true;
+}
+
+boolean ata_clear_irq(void *_dev)
+{
+    struct ata *dev = (struct ata *)_dev;
+    u8 status = ata_in8(dev, ATA_STATUS);
+    return (status & (ATA_S_ERROR | ATA_S_DWF));
 }
 
 closure_function(2, 3, void, ata_io_cmd_cfn,
@@ -311,6 +346,7 @@ boolean ata_probe(struct ata *dev)
 
     // disable interrupts
     ata_out8(dev, ATA_CONTROL, ATA_A_IDS);
+    dev->irq_enabled = false;
 
     // identify
     ata_out8(dev, ATA_COMMAND, ATA_ATA_IDENTIFY);

@@ -16,6 +16,7 @@
 #include <drivers/console.h>
 #include <kvm_platform.h>
 #include <xen_platform.h>
+#include <hyperv_platform.h>
 
 #define BOOT_PARAM_OFFSET_E820_ENTRIES  0x01E8
 #define BOOT_PARAM_OFFSET_BOOT_FLAG     0x01FE
@@ -398,9 +399,13 @@ static void __attribute__((noinline)) init_service_new_stack()
     if (!kvm_detect(kh)) {
         init_debug("probing for Xen hypervisor");
         if (!xen_detect(kh)) {
-            init_debug("neither KVM nor Xen detected; assuming qemu full emulation");
-            if (!init_hpet(kh)) {
-                halt("HPET initialization failed; no timer source\n");
+            if (!hyperv_detect(kh)) {
+                init_debug("no hypervisor detected; assuming qemu full emulation");
+                if (!init_hpet(kh)) {
+                    halt("HPET initialization failed; no timer source\n");
+                }
+            } else {
+                init_debug("hyper-v hypervisor detected");
             }
         } else {
             init_debug("xen hypervisor detected");
@@ -428,8 +433,9 @@ static void __attribute__((noinline)) init_service_new_stack()
         fs_offset = 0;
     else
         fs_offset = rootfs_part->lba_start * SECTOR_SIZE;
-    init_storage(kh, closure(misc, attach_storage, root, fs_offset));
+    storage_attach sa = closure(misc, attach_storage, root, fs_offset);
 
+    boolean hyperv_storvsc_attached = false;
     /* Probe for PV devices */
     if (xen_detected()) {
         init_debug("probing for Xen PV network...");
@@ -437,12 +443,20 @@ static void __attribute__((noinline)) init_service_new_stack()
         status s = xen_probe_devices();
         if (!is_ok(s))
             rprintf("xen probe failed: %v\n", s);
+    } else if (hyperv_detected()) {
+        init_debug("probing for Hyper-V PV network...");
+        init_vmbus(kh);
+        status s = hyperv_probe_devices(sa, &hyperv_storvsc_attached);
+        if (!is_ok(s))
+            rprintf("Hyper-V probe failed: %v\n", s);
     } else {
         init_debug("probing for virtio PV network...");
         /* qemu virtio */
         init_virtio_network(kh);
         init_vmxnet3_network(kh);
     }
+
+    init_storage(kh, sa, hyperv_storvsc_attached);
 
     init_debug("pci_discover (for virtio & ata)");
     pci_discover(); // do PCI discover again for other devices
