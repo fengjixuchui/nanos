@@ -104,7 +104,6 @@ enum storvsc_request_type {
 };
 
 #define STORVSC_CDB_SIZE    16
-#define STORVSC_SENSE_SIZE  256
 
 struct storvsc_hcb {
     struct list links;
@@ -122,7 +121,7 @@ struct storvsc_hcb {
     u32 alloc_len;                     // allocated data length
     void *data;                       // allocated data
 
-    u8 sense[STORVSC_SENSE_SIZE];
+    u8 sense[SENSE_BUFFER_SIZE];
 };
 
 
@@ -615,7 +614,7 @@ static void hv_storvsc_on_channel_callback(struct vmbus_channel *channel, void *
         bytes_recvd = pad(VSTOR_PKT_SIZE, 8),
         ret = vmbus_chan_recv(channel, packet, (int*)&bytes_recvd,
             &request_id);
-        assert(ret != ENOBUFS); //storvsc recvbuf is not large enoughD"));
+        assert(ret != ENOBUFS); //storvsc recvbuf is not large enough
         /*
          * XXX check bytes_recvd to make sure that it contains
          * enough data
@@ -900,7 +899,7 @@ static status storvsc_attach(kernel_heaps kh, hv_device* device, storage_attach 
 {
     heap h = heap_general(kh);
 
-    struct storvsc_softc *sc = allocate(h, sizeof(struct storvsc_softc));
+    struct storvsc_softc *sc = allocate_zero(h, sizeof(struct storvsc_softc));
     assert(sc != INVALID_ADDRESS);
 
     sc->general = h;
@@ -1055,7 +1054,7 @@ static void create_storvsc_request(struct storvsc_hcb *hcb, struct hv_storvsc_re
     }
 
     reqp->sense_data     = &hcb->sense;
-    reqp->sense_info_len = sizeof(&hcb->sense);
+    reqp->sense_info_len = sizeof(hcb->sense);
 
     reqp->hcb = hcb;
 
