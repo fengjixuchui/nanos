@@ -18,13 +18,14 @@ extern io_status_handler ignore_io_status;
 #define MIN_EXTENT_SIZE PAGESIZE
 #define MAX_EXTENT_SIZE (1 * MB)
 
+boolean filesystem_probe(u8 *first_sector, u8 *uuid);
+void filesystem_get_uuid(filesystem fs, u8 *uuid);
+
 void create_filesystem(heap h,
                        u64 blocksize,
                        u64 size,
                        block_io read,
                        block_io write,
-                       pagecache pc,
-                       tuple root,
                        boolean initialize,
                        filesystem_complete complete);
 void destroy_filesystem(filesystem fs);
@@ -41,10 +42,6 @@ void filesystem_write_sg(fsfile f, sg_list sg, range q, status_handler completio
 void filesystem_read_linear(fsfile f, void *dest, range q, io_status_handler completion);
 void filesystem_write_linear(fsfile f, void *src, range q, io_status_handler completion);
 
-void filesystem_write_tuple(filesystem fs, tuple t);
-void filesystem_write_eav(filesystem fs, tuple t, symbol a, value v);
-
-boolean filesystem_truncate(filesystem fs, fsfile f, u64 len);
 void filesystem_flush(filesystem fs, status_handler completion);
 
 timestamp filesystem_get_atime(filesystem fs, tuple t);
@@ -75,14 +72,18 @@ typedef enum {
     FS_STATUS_NOMEM,
 } fs_status;
 
+fs_status filesystem_write_tuple(filesystem fs, tuple t);
+fs_status filesystem_write_eav(filesystem fs, tuple t, symbol a, value v);
+
 typedef closure_type(fs_status_handler, void, fsfile, fs_status);
 
 void filesystem_alloc(filesystem fs, tuple t, long offset, long len,
         boolean keep_size, fs_status_handler completion);
 void filesystem_dealloc(filesystem fs, tuple t, long offset, long len,
         fs_status_handler completion);
+fs_status filesystem_truncate(filesystem fs, fsfile f, u64 len);
 
-void do_mkentry(filesystem fs, tuple parent, const char *name, tuple entry,
+fs_status do_mkentry(filesystem fs, tuple parent, const char *name, tuple entry,
         boolean persistent);
 
 fs_status filesystem_mkentry(filesystem fs, tuple cwd, const char *fp, tuple entry,
@@ -93,10 +94,10 @@ tuple filesystem_mkdir(filesystem fs, tuple parent, const char *name);
 tuple filesystem_creat(filesystem fs, tuple parent, const char *name);
 tuple filesystem_symlink(filesystem fs, tuple parent, const char *name,
                          const char *target);
-void filesystem_delete(filesystem fs, tuple parent, symbol sym);
-void filesystem_rename(filesystem fs, tuple oldparent, symbol oldsym,
+fs_status filesystem_delete(filesystem fs, tuple parent, symbol sym);
+fs_status filesystem_rename(filesystem fs, tuple oldparent, symbol oldsym,
                        tuple newparent, const char *newname);
-void filesystem_exchange(filesystem fs, tuple parent1, symbol sym1,
+fs_status filesystem_exchange(filesystem fs, tuple parent1, symbol sym1,
                          tuple parent2, symbol sym2);
 
 tuple filesystem_getroot(filesystem fs);

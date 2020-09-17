@@ -196,14 +196,15 @@ declare_closure_struct(1, 0, void, resume_syscall,
                        thread, t);
 declare_closure_struct(1, 0, void, run_thread,
                        thread, t);
+declare_closure_struct(1, 0, void, pause_thread,
+                        thread, t);
 declare_closure_struct(1, 0, void, run_sighandler,
                        thread, t);
 declare_closure_struct(1, 1, context, default_fault_handler,
                        thread, t,
                        context, frame);
-declare_closure_struct(7, 0, void, thread_demand_file_page,
-                       thread, t, context, frame, pagecache_node, pn, u64, node_offset,
-                       u64, page_addr, u64, flags, boolean, shared);
+declare_closure_struct(5, 0, void, thread_demand_file_page,
+                       thread, t, struct vmap *, vm, u64, node_offset, u64, page_addr, u64, flags);
 declare_closure_struct(3, 1, void, thread_demand_file_page_complete,
                        thread, t, context, frame, u64, vaddr,
                        status, s);
@@ -215,6 +216,7 @@ declare_closure_struct(3, 1, void, thread_demand_file_page_complete,
 #define set_thread_frame(t, f) do { (t)->active_frame = (f); } while(0)
 
 typedef struct thread {
+    struct nanos_thread thrd;
     context default_frame;
     context sighandler_frame;
     context active_frame;         /* mux between default and sighandler */
@@ -234,6 +236,7 @@ typedef struct thread {
     struct refcount refcount;
     closure_struct(free_thread, free);
     closure_struct(run_thread, run_thread);
+    closure_struct(pause_thread, pause_thread);
     closure_struct(run_sighandler, run_sighandler);
     closure_struct(default_fault_handler, fault_handler);
     closure_struct(thread_demand_file_page, demand_file_page);
@@ -305,13 +308,17 @@ typedef struct fdesc {
 
 #define IOV_MAX 1024
 
+#define FILE_READAHEAD_DEFAULT  (128 * KB)
+
 struct file {
     struct fdesc f;             /* must be first */
+    filesystem fs;
     union {
         struct {
             fsfile fsf;         /* fsfile for regular files */
             sg_io fs_read;
             sg_io fs_write;
+            int fadv;           /* posix_fadvise advice */
         };
         tuple meta;             /* meta tuple for others */
     };
@@ -323,6 +330,7 @@ sysreturn ioctl_generic(fdesc f, unsigned long request, vlist ap);
 
 void epoll_finish(epoll e);
 
+#define VMAP_FLAG_PROT_MASK 0x000f
 #define VMAP_FLAG_EXEC     0x0001
 #define VMAP_FLAG_WRITABLE 0x0002
 #define VMAP_FLAG_READABLE 0x0004
@@ -336,9 +344,16 @@ void epoll_finish(epoll e);
 #define VMAP_MMAP_TYPE_FILEBACKED 0x0200
 #define VMAP_MMAP_TYPE_IORING     0x0400
 
+#define ACCESS_PERM_READ    VMAP_FLAG_READABLE
+#define ACCESS_PERM_WRITE   VMAP_FLAG_WRITABLE
+#define ACCESS_PERM_EXEC    VMAP_FLAG_EXEC
+#define ACCESS_PERM_ALL     \
+    (ACCESS_PERM_READ | ACCESS_PERM_WRITE | ACCESS_PERM_EXEC)
+
 typedef struct vmap {
     struct rmnode node;
     u32 flags;
+    u32 allowed_flags;
     pagecache_node cache_node;
     u64 node_offset;
 } *vmap;
@@ -349,7 +364,12 @@ typedef struct varea {
     boolean allow_fixed;
 } *varea;
 
-#define ivmap(__f, __o, __c) (struct vmap){.flags = __f, .node_offset = __o, .cache_node = __c}
+#define ivmap(__f, __af, __o, __c) (struct vmap) {  \
+    .flags = __f,                                   \
+    .allowed_flags = __f | __af,                    \
+    .node_offset = __o,                             \
+    .cache_node = __c,                              \
+}
 typedef closure_type(vmap_handler, void, vmap);
 
 static inline u64 page_map_flags(u64 vmflags)
@@ -379,7 +399,8 @@ typedef struct process {
     id_heap           virtual_page; /* pagesized, default for mmaps */
     id_heap           virtual32; /* for tracking low 32-bit space and MAP_32BIT maps */
     id_heap           fdallocator;
-    filesystem        fs;       /* XXX should be underneath tuple operators */
+    filesystem        root_fs;
+    filesystem        cwd_fs;
     tuple             process_root;
     tuple             cwd;
     table             futices;
@@ -409,9 +430,28 @@ typedef struct sigaction *sigaction;
 
 extern thread dummy_thread;
 // seems like we could extract this from the frame or remove the thread entry in the frame
+#ifdef CURRENT_DEBUG
+#define current _current(__func__)
+static inline thread _current(const char *caller) {
+    if (current_cpu()->current_thread == INVALID_ADDRESS &&
+      runtime_strcmp("run_thread_frame", caller) != 0 &&
+      runtime_strcmp("thread_wakeup", caller) != 0) {
+        log_printf("CURRENT", "invalid address returned to caller '%s'\n", caller);
+        print_stack_from_here();
+    }
+    return (thread)(current_cpu()->current_thread);
+}
+#else
 #define current ((thread)(current_cpu()->current_thread))
+#endif
+
 
 void init_thread_fault_handler(thread t);
+
+static inline boolean proc_is_exec_protected(process p)
+{
+    return !!table_find(p->process_root, sym(exec_protection));
+}
 
 static inline fsfile file_get_fsfile(file f)
 {
@@ -421,6 +461,44 @@ static inline fsfile file_get_fsfile(file f)
 static inline tuple file_get_meta(file f)
 {
     return f->f.type == FDESC_TYPE_REGULAR ? fsfile_get_meta(f->fsf) : f->meta;
+}
+
+static inline boolean fdesc_is_readable(fdesc f)
+{
+    return ((f->flags & O_ACCMODE) != O_WRONLY);
+}
+
+static inline boolean fdesc_is_writable(fdesc f)
+{
+    return ((f->flags & O_ACCMODE) != O_RDONLY);
+}
+
+static inline u32 anon_perms(process p)
+{
+    if (proc_is_exec_protected(p))
+        return (ACCESS_PERM_READ | ACCESS_PERM_WRITE);
+    return ACCESS_PERM_ALL;
+}
+
+static inline u32 file_meta_perms(process p, tuple m)
+{
+    if (proc_is_exec_protected(p)) {
+        if (table_find(m, sym(exec)))
+            return (ACCESS_PERM_READ | ACCESS_PERM_EXEC);
+        else
+            return (ACCESS_PERM_READ | ACCESS_PERM_WRITE);
+    }
+    return ACCESS_PERM_ALL;
+}
+
+static inline u32 file_perms(process p, file f)
+{
+    u32 perms = file_meta_perms(p, file_get_meta(f));
+    if (!fdesc_is_readable(&f->f))
+        perms &= ~ACCESS_PERM_READ;
+    if (!fdesc_is_writable(&f->f))
+        perms &= ~ACCESS_PERM_WRITE;
+    return perms;
 }
 
 static inline thread thread_from_tid(process p, int tid)
@@ -439,11 +517,7 @@ static inline void thread_release(thread t)
     refcount_release(&t->refcount);
 }
 
-static inline unix_heaps get_unix_heaps()
-{
-    assert(current);
-    return &current->uh;
-}
+unix_heaps get_unix_heaps();
 
 static inline kernel_heaps get_kernel_heaps()
 {
@@ -596,9 +670,9 @@ static inline boolean sigstate_is_pending(sigstate ss, int sig)
     return (ss->pending & mask_from_sig(sig)) != 0;
 }
 
-static inline sigaction sigaction_from_sig(int signum)
+static inline sigaction sigaction_from_sig(thread t, int signum)
 {
-    return &current->p->sigactions[signum - 1];
+    return &t->p->sigactions[signum - 1];
 }
 
 boolean dispatch_signals(thread t);
@@ -640,7 +714,7 @@ void truncate_file_maps(process p, fsfile f, u64 new_length);
 const char *string_from_mmap_type(int type);
 
 void thread_log_internal(thread t, const char *desc, ...);
-#define thread_log(__t, __desc, ...) thread_log_internal(__t, __desc, ##__VA_ARGS__)
+#define thread_log(__t, __desc, ...) do {if (__t == INVALID_ADDRESS) break; thread_log_internal(__t, __desc, ##__VA_ARGS__);} while (0)
 
 void thread_sleep_interruptible(void) __attribute__((noreturn));
 void thread_sleep_uninterruptible(void) __attribute__((noreturn));
@@ -781,3 +855,27 @@ void syscall_debug(context f);
 
 boolean validate_iovec(struct iovec *iov, u64 len, boolean write);
 boolean validate_user_string(const char *name);
+
+static inline boolean iov_to_sg(sg_list sg, struct iovec *iov, int iovlen)
+{
+    for (int i = 0; i < iovlen; i++) {
+        u64 len = iov[i].iov_len;
+        if (len == 0)
+            continue;
+        sg_buf sgb = sg_list_tail_add(sg, len);
+        if (!sgb)
+            return false;
+        sgb->buf = iov[i].iov_base;
+        sgb->size = len;
+        sgb->offset = 0;
+        sgb->refcount = 0;
+    }
+    return true;
+}
+
+static inline void sg_to_iov(sg_list sg, struct iovec *iov, int iovlen)
+{
+    for (int i = 0; i < iovlen; i++)
+        if (sg_copy_to_buf(iov[i].iov_base, sg, iov[i].iov_len) == 0)
+            break;
+}

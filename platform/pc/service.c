@@ -10,6 +10,7 @@
 #include <page.h>
 #include <storage.h>
 #include <symtab.h>
+#include <unix.h>
 #include <virtio/virtio.h>
 #include <vmware/vmxnet3.h>
 #include <drivers/storage.h>
@@ -106,37 +107,40 @@ closure_function(2, 3, void, offset_block_io,
 /* XXX some header reorg in order */
 void init_extra_prints(); 
 thunk create_init(kernel_heaps kh, tuple root, filesystem fs);
-filesystem_complete bootfs_handler(kernel_heaps kh, tuple root);
+filesystem_complete bootfs_handler(kernel_heaps kh);
 
-/* will become list I guess */
-static pagecache global_pagecache;
-
-closure_function(5, 2, void, fsstarted,
-                 heap, h, u8 *, mbr, block_io, r, block_io, w, tuple, root,
+closure_function(4, 2, void, fsstarted,
+                 heap, h, u8 *, mbr, block_io, r, block_io, w,
                  filesystem, fs, status, s)
 {
     if (!is_ok(s))
         halt("unable to open filesystem: %v\n", s);
+    if (root_fs)
+        halt("multiple root filesystems found\n");
 
     heap h = bound(h);
     u8 *mbr = bound(mbr);
+    tuple root = filesystem_getroot(fs);
+    storage_set_root_fs(fs);
+    tuple mounts = table_find(root, sym(mounts));
+    if (mounts && (tagof(mounts) == tag_tuple))
+        storage_set_mountpoints(mounts);
     if (mbr) {
         struct partition_entry *bootfs_part;
-        if (table_find(bound(root), sym(ingest_kernel_symbols)) &&
+        if (table_find(root, sym(ingest_kernel_symbols)) &&
                 (bootfs_part = partition_get(mbr, PARTITION_BOOTFS))) {
             init_debug("loading boot filesystem");
-            tuple bootfs_root = allocate_tuple();
             create_filesystem(h, SECTOR_SIZE,
                               bootfs_part->nsectors * SECTOR_SIZE,
                               closure(h, offset_block_io,
                               bootfs_part->lba_start * SECTOR_SIZE, bound(r)),
-                              0, global_pagecache, bootfs_root, false,
-                              bootfs_handler(&heaps, bootfs_root));
+                              0, false,
+                              bootfs_handler(&heaps));
         }
         deallocate(h, mbr, SECTOR_SIZE);
     }
     root_fs = fs;
-    enqueue(runqueue, create_init(&heaps, bound(root), fs));
+    enqueue(runqueue, create_init(&heaps, root, fs));
     closure_finish();
 }
 
@@ -151,73 +155,74 @@ closure_function(5, 2, void, fsstarted,
 #endif
 void mm_service(void)
 {
-    if (!global_pagecache)
-        return;
     heap p = (heap)heap_physical(&heaps);
     u64 free = heap_total(p) - heap_allocated(p);
     mm_debug("%s: total %ld, alloc %ld, free %ld\n", __func__, heap_total(p), heap_allocated(p), free);
     if (free < PAGECACHE_DRAIN_CUTOFF) {
         u64 drain_bytes = PAGECACHE_DRAIN_CUTOFF - free;
-        u64 drained = pagecache_drain(global_pagecache, drain_bytes);
+        u64 drained = pagecache_drain(drain_bytes);
         if (drained > 0)
             mm_debug("   drained %ld / %ld requested...\n", drained, drain_bytes);
     }
 }
 
-static void rootfs_init(heap h, u8 *mbr, tuple root, u64 offset,
+static void rootfs_init(heap h, u8 *mbr, u64 offset,
                         block_io r, block_io w, u64 length)
 {
     length -= offset;
-    pagecache pc = allocate_pagecache(h, h, (heap)heap_physical(&heaps), PAGESIZE);
-    if (pc == INVALID_ADDRESS)
-        halt("unable to create pagecache\n");
-
-    /* figure that later pagecaches will register themselves with backing - glue for now */
-    global_pagecache = pc;
     create_filesystem(h,
                       SECTOR_SIZE,
                       length,
                       closure(h, offset_block_io, offset, r),
                       closure(h, offset_block_io, offset, w),
-                      pc,
-                      root,
                       false,
-                      closure(h, fsstarted, h, mbr, r, w, root));
+                      closure(h, fsstarted, h, mbr, r, w));
 }
 
-closure_function(6, 1, void, mbr_read,
-                 heap, h, u8 *, mbr, tuple, root, block_io, r, block_io, w, u64, length,
+closure_function(5, 1, void, mbr_read,
+                 heap, h, u8 *, mbr, block_io, r, block_io, w, u64, length,
                  status, s)
 {
-    if (!is_ok(s))
-        halt("unable to read partitions: %v\n", s);
+    if (!is_ok(s)) {
+        msg_err("unable to read partitions: %v\n", s);
+        goto out;
+    }
     heap h = bound(h);
     u8 *mbr = bound(mbr);
     struct partition_entry *rootfs_part = partition_get(mbr, PARTITION_ROOTFS);
-    if (!rootfs_part)
-        halt("filesystem partition not found\n");
+    if (!rootfs_part) {
+        u8 uuid[UUID_LEN];
+        if (filesystem_probe(mbr, uuid))
+            volume_add(uuid, bound(r), bound(w), bound(length));
+        else
+            init_debug("unformatted storage device, ignoring");
+        deallocate(h, mbr, SECTOR_SIZE);
+    }
     else
-        rootfs_init(h, mbr, bound(root), rootfs_part->lba_start * SECTOR_SIZE,
+        rootfs_init(h, mbr, rootfs_part->lba_start * SECTOR_SIZE,
             bound(r), bound(w), bound(length));
+  out:
     closure_finish();
 }
 
-closure_function(2, 3, void, attach_storage,
-                 tuple, root, u64, fs_offset,
+closure_function(0, 3, void, attach_storage,
                  block_io, r, block_io, w, u64, length)
 {
     heap h = heap_general(&heaps);
-    tuple root = bound(root);
-    u64 offset = bound(fs_offset);
-    if (offset == 0) {
-        /* Read partition table from disk */
-        u8 *mbr = allocate(h, SECTOR_SIZE);
-        assert(mbr != INVALID_ADDRESS);
-        apply(r, mbr, irange(0, SECTOR_SIZE),
-              closure(h, mbr_read, h, mbr, root, r, w, length));
-    } else
-        rootfs_init(h, 0, root, offset, r, w, length);
-    closure_finish();
+
+    /* Look for partition table */
+    u8 *mbr = allocate(h, SECTOR_SIZE);
+    if (mbr == INVALID_ADDRESS) {
+        msg_err("cannot allocate memory for MBR sector\n");
+        return;
+    }
+    status_handler sh = closure(h, mbr_read, h, mbr, r, w, length);
+    if (sh == INVALID_ADDRESS) {
+        msg_err("cannot allocate MBR read closure\n");
+        deallocate(h, mbr, SECTOR_SIZE);
+        return;
+    }
+    apply(r, mbr, irange(0, 1), sh);
 }
 
 static void read_kernel_syms()
@@ -296,8 +301,6 @@ static void reclaim_regions(void)
     }
 }
 
-static tuple root;
-
 void vm_exit(u8 code)
 {
 #ifdef SMP_DUMP_FRAME_RETURN_COUNT
@@ -309,7 +312,16 @@ void vm_exit(u8 code)
     }
 #endif
 
+#ifdef DUMP_MEM_STATS
+    buffer b = allocate_buffer(heap_general(&heaps), 512);
+    if (b != INVALID_ADDRESS) {
+        dump_mem_stats(b);
+        buffer_print(b);
+    }
+#endif
+
     /* TODO MP: coordinate via IPIs */
+    tuple root = root_fs ? filesystem_getroot(root_fs) : 0;
     if (root && table_find(root, sym(reboot_on_exit))) {
         triple_fault();
     } else {
@@ -329,11 +341,23 @@ void kernel_shutdown(int status)
 {
     shutting_down = true;
     apic_ipi(TARGET_EXCLUSIVE_BROADCAST, 0, shutdown_vector);
-    if (global_pagecache) {
-        filesystem_flush(root_fs, closure(heap_general(&heaps), sync_complete, status));
+    if (root_fs) {
+        storage_sync(closure(heap_general(&heaps), sync_complete, status));
         runloop();
     }
     vm_exit(status);
+}
+
+void kernel_shutdown_ex(status_handler completion)
+{
+    shutting_down = true;
+    apic_ipi(TARGET_EXCLUSIVE_BROADCAST, 0, shutdown_vector);
+    if (root_fs) {
+        storage_sync(completion);
+        runloop();
+    }
+    apply(completion, 0);
+    while(1);
 }
 
 u64 total_processors = 1;
@@ -368,6 +392,7 @@ static void __attribute__((noinline)) init_service_new_stack()
     init_tuples(allocate_tagged_region(kh, tag_tuple));
     init_symbols(allocate_tagged_region(kh, tag_symbol), misc);
     init_sg(misc);
+    init_pagecache(misc, misc, (heap)heap_physical(kh), PAGESIZE);
     unmap(0, PAGESIZE);         /* unmap zero page */
     reclaim_regions();          /* unmap and reclaim stage2 stack */
     init_extra_prints();
@@ -425,21 +450,15 @@ static void __attribute__((noinline)) init_service_new_stack()
     init_net(kh);
 
     init_debug("probe fs, register storage drivers");
-    root = allocate_tuple();
-    struct partition_entry *rootfs_part = partition_get(MBR_ADDRESS,
-        PARTITION_ROOTFS);
-    u64 fs_offset;
-    if (!rootfs_part)
-        fs_offset = 0;
-    else
-        fs_offset = rootfs_part->lba_start * SECTOR_SIZE;
-    storage_attach sa = closure(misc, attach_storage, root, fs_offset);
+    init_volumes(misc);
+    storage_attach sa = closure(misc, attach_storage);
 
     boolean hyperv_storvsc_attached = false;
     /* Probe for PV devices */
     if (xen_detected()) {
         init_debug("probing for Xen PV network...");
         init_xennet(kh);
+        init_xenblk(kh, sa);
         status s = xen_probe_devices();
         if (!is_ok(s))
             rprintf("xen probe failed: %v\n", s);
@@ -456,7 +475,7 @@ static void __attribute__((noinline)) init_service_new_stack()
         init_vmxnet3_network(kh);
     }
 
-    init_storage(kh, sa, hyperv_storvsc_attached);
+    init_storage(kh, sa, !xen_detected() && !hyperv_storvsc_attached);
 
     init_debug("pci_discover (for virtio & ata)");
     pci_discover(); // do PCI discover again for other devices
@@ -585,6 +604,7 @@ static void cmdline_parse(const char *cmdline)
 // init linker set
 void init_service(u64 rdi, u64 rsi)
 {
+    init_debug("init_service");
     u8 *params = pointer_from_u64(rsi);
     const char *cmdline = 0;
     u32 cmdline_size;
@@ -595,7 +615,7 @@ void init_service(u64 rdi, u64 rsi)
         u8 e820_entries = *(params + BOOT_PARAM_OFFSET_E820_ENTRIES);
         region e820_r = (region)(params + BOOT_PARAM_OFFSET_E820_TABLE);
         extern u8 END;
-        u64 kernel_size = u64_from_pointer(&END - KERNEL_BASE);
+        u64 kernel_size = u64_from_pointer(&END) - KERNEL_BASE;
         u64 *pdpt = 0;
         u64 *pdt = 0;
         for (u8 entry = 0; entry < e820_entries; entry++) {
@@ -663,9 +683,8 @@ void init_service(u64 rdi, u64 rsi)
     cr &= ~C0_EM;
     mov_to_cr("cr0", cr);
     mov_from_cr("cr4", cr);
-    cr |= CR4_OSFXSR | CR4_OSXMMEXCPT | CR4_OSXSAVE;
+    cr |= CR4_OSFXSR | CR4_OSXMMEXCPT /* | CR4_OSXSAVE */;
     mov_to_cr("cr4", cr);
-    init_debug("init_service");
     init_kernel_heaps();
     if (cmdline)
         cmdline_parse(cmdline);

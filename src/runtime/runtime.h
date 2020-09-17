@@ -25,6 +25,8 @@ typedef u64 timestamp;
 #define MB (KB*KB)
 #define GB (KB*MB)
 
+#define UUID_LEN    16
+
 void console_write(const char *s, bytes count);
 
 void print_u64(u64 s);
@@ -178,6 +180,8 @@ typedef closure_type(thunk, void);
 #include <clock.h>
 #include <timer.h>
 
+void kernel_shutdown_ex(status_handler completion) __attribute__((noreturn));
+
 typedef closure_type(buffer_handler, status, buffer);
 typedef closure_type(connection_handler, buffer_handler, buffer_handler);
 typedef closure_type(io_status_handler, void, status, bytes);
@@ -207,6 +211,7 @@ void init_runtime(heap h);
 
 extern thunk ignore;
 extern status_handler ignore_status;
+extern value null_value;
 
 #include <metadata.h>
 

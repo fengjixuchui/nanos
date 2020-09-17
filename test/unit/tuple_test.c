@@ -35,7 +35,7 @@ boolean all_tests(heap h)
     }
     tuple t2 = tuple_from_vector(v1);
     test_assert(table_elements(t2) == COUNT_ELM);//rprintf("%t\n", t2);
-    destruct_tuple(t2);
+    destruct_tuple(t2, true);
     deallocate_vector(v1);
 
     // value <-> U64
@@ -56,7 +56,7 @@ boolean all_tests(heap h)
 
     failure = false;
 fail:
-    destruct_tuple(t1);
+    destruct_tuple(t1, true);
     return failure;
 }
 
@@ -70,28 +70,38 @@ boolean encode_decode_test(heap h)
     table_set(t3, intern_u64(1), wrap_buffer_cstring(h, "200"));
 
     tuple tdict1 = allocate_tuple();
+    u64 total_entries = 0;
 
-    encode_tuple(b3, tdict1, t3);
+    encode_tuple(b3, tdict1, t3, &total_entries);
 
     test_assert(buffer_length(b3) > 0);
+    test_assert(total_entries == 1);
 
     // decode
     table tdict2 = allocate_table(h, identity_key, pointer_equal);
-    tuple t4 = decode_value(h, tdict2, b3);
+    total_entries = 0;
+    u64 obsolete_entries = 0;
+    tuple t4 = decode_value(h, tdict2, b3, &total_entries, &obsolete_entries);
 
+    test_assert((total_entries == 1) && (obsolete_entries == 0));
     buffer buf = allocate_buffer(h, 128);
     bprintf(buf, "%t", t4);
     test_assert(strncmp(buf->contents, "(1:200)", buffer_length(buf)) == 0);
 
     // update tuple by removing an entry
-    encode_eav(b3, tdict1, t3, intern_u64(1), 0);
-    test_assert(decode_value(h, tdict2, b3) == t4);
+    obsolete_entries = 0;
+    encode_eav(b3, tdict1, t3, intern_u64(1), 0, &obsolete_entries);
+    test_assert(obsolete_entries == 2);
+    obsolete_entries = 0;
+    test_assert(decode_value(h, tdict2, b3,
+        &total_entries, &obsolete_entries) == t4);
     test_assert(!table_find(t4, intern_u64(1)));
+    test_assert((total_entries == 2) && (obsolete_entries == 2));
 
-    destruct_tuple(t4);
+    destruct_tuple(t4, true);
     failure = false;
 fail:
-    destruct_tuple(t3);
+    destruct_tuple(t3, true);
     return failure;
 }
 
@@ -108,14 +118,22 @@ boolean encode_decode_reference_test(heap h)
     table_set(t3, intern_u64(2), t33);
 
     tuple tdict1 = allocate_tuple();
+    u64 total_entries = 0;
 
-    encode_tuple(b3, tdict1, t3);
+    encode_tuple(b3, tdict1, t3, &total_entries);
 
     test_assert(buffer_length(b3) > 0);
+    test_assert(total_entries == 4);    /* 2 entries for t3, plus 2 for t33 */
 
     // decode
+    total_entries = 0;
+    u64 obsolete_entries = 0;
     table tdict2 = allocate_table(h, identity_key, pointer_equal);
-    tuple t4 = decode_value(h, tdict2, b3);
+    tuple t4 = decode_value(h, tdict2, b3, &total_entries, &obsolete_entries);
+
+    /* t33 has been encoded twice (because it is associated to 2 different
+     * symbols in t3), and the second encoding obsoletes the first encoding. */
+    test_assert((total_entries == 4) && (obsolete_entries == 1));
 
     buffer buf = allocate_buffer(h, 128);
     bprintf(buf, "%t", t4);
@@ -139,22 +157,26 @@ boolean encode_decode_lengthy_test(heap h)
     }
 
     tuple tdict1 = allocate_tuple();
+    u64 total_entries = 0;
 
-    encode_tuple(b3, tdict1, t3);
+    encode_tuple(b3, tdict1, t3, &total_entries);
 
     test_assert(buffer_length(b3) > 0);
+    test_assert(total_entries == 1000);
 
     // decode
+    total_entries = 0;
+    u64 obsolete_entries = 0;
     table tdict2 = allocate_table(h, identity_key, pointer_equal);
-    tuple t4 = decode_value(h, tdict2, b3);
+    tuple t4 = decode_value(h, tdict2, b3, &total_entries, &obsolete_entries);
 
-    //rprintf("%t\n", t4);
+    test_assert((total_entries == 1000) && (obsolete_entries == 0));
     test_assert(t4->count == 1000);
 
-    destruct_tuple(t4);
+    destruct_tuple(t4, true);
     failure = false;
 fail:
-    destruct_tuple(t3);
+    destruct_tuple(t3, true);
     return failure;
 }
 

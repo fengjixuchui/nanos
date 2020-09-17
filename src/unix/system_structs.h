@@ -113,6 +113,7 @@ typedef struct iovec {
 #define O_RDONLY	00000000
 #define O_WRONLY	00000001
 #define O_RDWR		00000002
+#define O_ACCMODE	00000003
 #define O_CREAT		00000100
 #define O_EXCL          00000200
 #define O_NOCTTY        00000400
@@ -139,6 +140,12 @@ typedef struct iovec {
 #define F_DUPFD_CLOEXEC (F_LINUX_SPECIFIC_BASE + 6)
 #define F_SETPIPE_SZ    (F_LINUX_SPECIFIC_BASE + 7)
 #define F_GETPIPE_SZ    (F_LINUX_SPECIFIC_BASE + 8)
+
+/* Values for 'mode' argument of access/faccessat syscalls */
+#define F_OK    0x0
+#define X_OK    0x1
+#define W_OK    0x2
+#define R_OK    0x4
 
 struct flock {
     s16 l_type;
@@ -389,6 +396,19 @@ struct rusage {
 #define BUS_MCERR_AR 4
 #define BUS_MCERR_AO 5
 #define NSIGBUS      5
+
+/*
+ * SIGFPE si_codes
+ */
+#define FPE_INTDIV 1 /* Integer divide by zero */
+#define FPE_INTOVF 2 /* Integer overflow */
+#define FPE_FLTDIV 3 /* Floating-point divide by zero */
+#define FPE_FLTOVF 4 /* Floating-point overflow */
+#define FPE_FLTUND 5 /* Floating-point underflow */
+#define FPE_FLTRES 6 /* Floating-point inexact result */
+#define FPE_FLTINV 7 /* Floating-point invalid operation */
+#define FPE_FLTSUB 8 /* Subscript out of range */
+#define NSIGFPE 8
 
 typedef union sigval {
     s32 sival_int;
@@ -914,3 +934,11 @@ struct io_uring_params {
 #define FALLOC_FL_COLLAPSE_RANGE    0x08
 #define FALLOC_FL_ZERO_RANGE        0x10
 #define FALLOC_FL_INSERT_RANGE      0x20
+
+/* posix_fadvise advice types */
+#define POSIX_FADV_NORMAL       0
+#define POSIX_FADV_RANDOM       1
+#define POSIX_FADV_SEQUENTIAL   2
+#define POSIX_FADV_WILLNEED     3
+#define POSIX_FADV_DONTNEED     4
+#define POSIX_FADV_NOREUSE      5

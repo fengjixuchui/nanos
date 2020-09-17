@@ -5,11 +5,19 @@
 #include <net.h>
 #include <http.h>
 #include <gdb.h>
+#include <storage.h>
 #include <symtab.h>
 #include <virtio/virtio.h>
 
-closure_function(2, 1, status, read_program_complete,
-                 process, kp, tuple, root,
+closure_function(2, 0, void, program_start,
+                 buffer, elf, process, kp)
+{
+    exec_elf(bound(elf), bound(kp));
+    closure_finish();
+}
+
+closure_function(3, 1, status, read_program_complete,
+                 heap, h, process, kp, tuple, root,
                  buffer, b)
 {
     tuple root = bound(root);
@@ -28,7 +36,7 @@ closure_function(2, 1, status, read_program_complete,
 #endif
        
     }
-    exec_elf(b, bound(kp));
+    storage_when_ready(closure(bound(h), program_start, b, bound(kp)));
     closure_finish();
     return STATUS_OK;
 }
@@ -151,7 +159,7 @@ closure_function(3, 0, void, startup,
 	halt("unable to initialize unix instance; halt\n");
     }
     heap general = heap_general(kh);
-    buffer_handler pg = closure(general, read_program_complete, kp, root);
+    buffer_handler pg = closure(general, read_program_complete, general, kp, root);
 
     if (table_find(root, sym(telnet))) {
         listen_port(general, 9090, closure(general, each_telnet_connection, general));
@@ -173,6 +181,8 @@ closure_function(3, 0, void, startup,
     value p = table_find(root, sym(program));
     assert(p);
     tuple pro = resolve_path(root, split(general, p, '/'));
+    if (table_find(root, sym(exec_protection)))
+        table_set(pro, sym(exec), null_value);  /* set executable flag */
     init_network_iface(root);
     filesystem_read_entire(fs, pro, heap_backed(kh), pg, closure(general, read_program_fail));
     closure_finish();
@@ -183,23 +193,22 @@ thunk create_init(kernel_heaps kh, tuple root, filesystem fs)
     return closure(heap_general(kh), startup, kh, root, fs);
 }
 
-closure_function(2, 1, status, kernel_read_complete,
-                 filesystem, fs, tuple, root,
+closure_function(1, 1, status, kernel_read_complete,
+                 filesystem, fs,
                  buffer, b)
 {
     add_elf_syms(b);
     deallocate_buffer(b);
     destroy_filesystem(bound(fs));
-    deallocate_tuple(bound(root));
     closure_finish();
     return STATUS_OK;
 }
 
-closure_function(2, 2, void, bootfs_complete,
-                 kernel_heaps, kh, tuple, root,
+closure_function(1, 2, void, bootfs_complete,
+                 kernel_heaps, kh,
                  filesystem, fs, status, s)
 {
-    tuple root = bound(root);
+    tuple root = filesystem_getroot(fs);
     tuple c = children(root);
     assert(c);
     table_foreach(c, k, v) {
@@ -207,7 +216,7 @@ closure_function(2, 2, void, bootfs_complete,
             kernel_heaps kh = bound(kh);
             filesystem_read_entire(fs, v, heap_backed(kh),
                                    closure(heap_general(kh),
-                                   kernel_read_complete, fs, bound(root)),
+                                   kernel_read_complete, fs),
                                    ignore_status);
             break;
         }
@@ -215,7 +224,7 @@ closure_function(2, 2, void, bootfs_complete,
     closure_finish();
 }
 
-filesystem_complete bootfs_handler(kernel_heaps kh, tuple root)
+filesystem_complete bootfs_handler(kernel_heaps kh)
 {
-    return closure(heap_general(kh), bootfs_complete, kh, root);
+    return closure(heap_general(kh), bootfs_complete, kh);
 }

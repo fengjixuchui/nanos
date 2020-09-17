@@ -366,14 +366,21 @@ void filesystem_read_entire(filesystem fs, tuple t, heap bufheap, buffer_handler
 }
 
 #ifndef TFS_READ_ONLY
-void filesystem_write_tuple(filesystem fs, tuple t)
+fs_status filesystem_write_tuple(filesystem fs, tuple t)
 {
-    log_write(fs->tl, t);
+    if (log_write(fs->tl, t) && (!fs->temp_log || log_write(fs->temp_log, t)))
+        return FS_STATUS_OK;
+    else
+        return FS_STATUS_NOSPACE;
 }
 
-void filesystem_write_eav(filesystem fs, tuple t, symbol a, value v)
+fs_status filesystem_write_eav(filesystem fs, tuple t, symbol a, value v)
 {
-    log_write_eav(fs->tl, t, a, v);
+    if (log_write_eav(fs->tl, t, a, v) &&
+            (!fs->temp_log || log_write_eav(fs->temp_log, t, a, v)))
+        return FS_STATUS_OK;
+    else
+        return FS_STATUS_NOSPACE;
 }
 
 /* create a new extent in the filesystem
@@ -418,9 +425,21 @@ static void destroy_extent(filesystem fs, extent ex)
     deallocate(fs->h, ex, sizeof(*ex));
 }
 
-static void add_extent_to_file(fsfile f, extent ex)
+static fs_status add_extent_to_file(fsfile f, extent ex)
 {
     heap h = f->fs->h;
+    tuple extents;
+    symbol a = sym(extents);
+    assert(f->md);
+    if (!(extents = table_find(f->md, a))) {
+        extents = allocate_tuple();
+        fs_status s = filesystem_write_eav(f->fs, f->md, a, extents);
+        if (s != FS_STATUS_OK) {
+            deallocate_tuple(extents);
+            return s;
+        }
+        table_set(f->md, a, extents);
+    }
 
     // XXX encode this as an immediate bitstring
     tuple e = allocate_tuple();
@@ -429,64 +448,32 @@ static void add_extent_to_file(fsfile f, extent ex)
     table_set(e, sym(length), value_from_u64(h, range_span(ex->node.r)));
     table_set(e, sym(allocated), value_from_u64(h, ex->allocated));
     if (ex->uninited)
-        table_set(e, sym(uninited), null_value());
+        table_set(e, sym(uninited), null_value);
+    symbol offs = intern_u64(ex->node.r.start);
+    fs_status s = filesystem_write_eav(f->fs, extents, offs, e);
+    if (s != FS_STATUS_OK) {
+        destruct_tuple(e, true);
+        return s;
+    }
+    table_set(extents, offs, e);
     tfs_debug("%s: f %p, reserve %R\n", __func__, f, ex->node.r);
     if (!rangemap_insert(f->extentmap, &ex->node)) {
         rbtree_dump(&f->extentmap->t, RB_INORDER);
         assert(0);
     }
-    tuple extents;
-    symbol a = sym(extents);
-    assert(f->md);
-    if (!(extents = table_find(f->md, a))) {
-        extents = allocate_tuple();
-        table_set(f->md, a, extents);
-        log_write_eav(f->fs->tl, f->md, a, extents);
-    }
-    symbol offs = intern_u64(ex->node.r.start);
-    table_set(extents, offs, e);
-    log_write_eav(f->fs->tl, extents, offs, e);
+    return FS_STATUS_OK;
 }
 
 static void remove_extent_from_file(fsfile f, extent ex)
 {
-    assert(ex->md);
-    string offset = table_find(ex->md, sym(offset));
-    assert(offset);
-    deallocate_buffer(offset);
-    string length = table_find(ex->md, sym(length));
-    assert(length);
-    deallocate_buffer(length);
-    string allocated = table_find(ex->md, sym(allocated));
-    assert(allocated);
-    deallocate_buffer(allocated);
-
-    /* This tuple is not deallocated because it is already referenced in the
-     * filesystem log and thus present in the dictionary. To avoid this leakage,
-     * we need additional functionalities in the filesystem log, e.g.:
-     * - being able to remove a dictionary entry without affecting the keys
-     * associated to the other (present and future) entries
-     * - being able to prune the log (and clean up the dictionary accordingly),
-     * to remove any log entries that are no longer relevant in the current
-     * status of the filesystem
-     */
-
-    /* might suggest we store a special value (invalid / zombie) that
-       acts as a terminator for the tuple in the log ... the
-       associated dictionary entry would remain allocated, and once
-       the log history has expired (when there is such a function) to
-       the point where the tuple is no longer referenced, the
-       associated entry is retired and the slot becomes free for use
-       again
-    */
+    /* The tuple corresponding to this extent will be destroyed when the
+     * filesystem log is compacted. */
 
     tuple extents = table_find(f->md, sym(extents));
     assert(extents);
-    clear_tuple(ex->md);
-    ex->md = 0;
     symbol offs = intern_u64(ex->node.r.start);
+    filesystem_write_eav(f->fs, extents, offs, 0);
     table_set(extents, offs, 0);
-    log_write_eav(f->fs->tl, extents, offs, 0);
     rangemap_remove_node(f->extentmap, &ex->node);
 }
 
@@ -523,6 +510,13 @@ static u64 write_extent(fsfile f, extent ex, sg_list sg, range blocks, merge m)
 
     if (sg) {
         if (ex->uninited) {
+            symbol a = sym(uninited);
+            fs_status fss = filesystem_write_eav(f->fs, ex->md, a, 0);
+            if (fss != FS_STATUS_OK) {
+                apply(apply_merge(m), timm("result", "failed to write log",
+                    "fsstatus", "%d", fss));
+                goto out;
+            }
             u64 data_end = i.end - ex->node.r.start;
             u64 extent_end = range_span(ex->node.r);
             if (data_offset > 0)
@@ -530,9 +524,7 @@ static u64 write_extent(fsfile f, extent ex, sg_list sg, range blocks, merge m)
             if (data_end < extent_end)
                 zero_blocks(fs, range_add(irange(data_end, extent_end), ex->start_block), m);
             assert(ex->md);
-            symbol a = sym(uninited);
             table_set(ex->md, a, 0);
-            filesystem_write_eav(f->fs, ex->md, a, 0);
             ex->uninited = false;
         }
         filesystem_storage_op(fs, sg, m, r, fs->w);
@@ -540,6 +532,7 @@ static u64 write_extent(fsfile f, extent ex, sg_list sg, range blocks, merge m)
         if (!ex->uninited)
             zero_blocks(fs, r, m);
     }
+  out:
     return i.end;
 }
 
@@ -552,14 +545,23 @@ static fs_status fill_gap(fsfile f, sg_list sg, range blocks, merge m, u64 *edge
     fs_status fss = create_extent(f->fs, blocks, false, &ex);
     if (fss != FS_STATUS_OK)
         return fss;
-    add_extent_to_file(f, ex);
+    fss = add_extent_to_file(f, ex);
+    if (fss != FS_STATUS_OK) {
+        destroy_extent(f->fs, ex);
+        return fss;
+    }
     write_extent(f, ex, sg, blocks, m);
     *edge = blocks.end;
     return FS_STATUS_OK;
 }
 
-static void update_extent_length(fsfile f, extent ex, u64 new_length)
+static fs_status update_extent_length(fsfile f, extent ex, u64 new_length)
 {
+    value v = value_from_u64(f->fs->h, new_length);
+    fs_status s = filesystem_write_eav(f->fs, ex->md, sym(length), v);
+    if (s != FS_STATUS_OK)
+        return s;
+
     /* TODO cheating; should be reinsert - update rangemap interface? */
     tfs_debug("   %s: was %R\n", __func__, ex->node.r);
     ex->node.r = irangel(ex->node.r.start, new_length);
@@ -568,9 +570,8 @@ static void update_extent_length(fsfile f, extent ex, u64 new_length)
     string length = table_find(ex->md, sym(length));
     assert(length);
     deallocate_buffer(length);
-    value v = value_from_u64(f->fs->h, new_length);
     table_set(ex->md, sym(length), v);
-    log_write_eav(f->fs->tl, ex->md, sym(length), v);
+    return FS_STATUS_OK;
 }
 
 static u64 extend(fsfile f, extent ex, sg_list sg, range blocks, merge m)
@@ -584,13 +585,19 @@ static u64 extend(fsfile f, extent ex, sg_list sg, range blocks, merge m)
     assert(blocks.start >= ex->node.r.end); // XXX temp
     assert(ex->node.r.end <= i.start); // XXX temp
     range z = irange(ex->node.r.end, i.start);
-    update_extent_length(f, ex, i.end - ex->node.r.start);
+    fs_status s = update_extent_length(f, ex, i.end - ex->node.r.start);
+    if (s != FS_STATUS_OK) {
+        apply(apply_merge(m), timm("result", "failed to update extent length",
+            "fsstatus", "%d", s));
+        goto out;
+    }
     if (range_span(z) > 0) {
         tfs_debug("      zero %R\n", z);
         write_extent(f, ex, 0, z, m);
     }
     tfs_debug("      write %R\n", i);
     write_extent(f, ex, sg, i, m);
+  out:
     return i.end;
 }
 
@@ -672,8 +679,12 @@ closure_function(2, 3, void, filesystem_storage_write,
 
     if (fsfile_get_length(f) < q.end) {
         tfs_debug("   append; update length to %ld\n", q.end);
-        fsfile_set_length(f, q.end);
-        log_write_eav(fs->tl, f->md, sym(filelength), value_from_u64(fs->h, q.end));
+        fs_status fss = filesystem_truncate(fs, f, q.end);
+        if (fss != FS_STATUS_OK) {
+            s = timm("result", "unable to set file length", "fsstatus", "%d",
+                fss);
+            goto out;
+        }
     }
   out:
     apply(sh, s);
@@ -706,14 +717,18 @@ void filesystem_write_linear(fsfile f, void *src, range q, io_status_handler io_
                                           sg, length, io_complete));
 }
 
-boolean filesystem_truncate(filesystem fs, fsfile f, u64 len)
+fs_status filesystem_truncate(filesystem fs, fsfile f, u64 len)
 {
-    if (fsfile_get_length(f) == len) {
-        return true;
+    value v = value_from_u64(fs->h, len);
+    if (v == INVALID_ADDRESS)
+        return FS_STATUS_NOMEM;
+    symbol l = sym(filelength);
+    fs_status s = filesystem_write_eav(fs, f->md, l, v);
+    if (s == FS_STATUS_OK) {
+        table_set(f->md, l, v);
+        fsfile_set_length(f, len);
     }
-    fsfile_set_length(f, len);
-    log_write_eav(fs->tl, f->md, sym(filelength), value_from_u64(fs->h, len));
-    return false;
+    return s;
 }
 
 closure_function(3, 1, void, log_flush_completed,
@@ -756,13 +771,16 @@ closure_function(0, 1, void, assert_no_node,
     halt("tfs: temporary rangemap not empty on dealloc\n");
 }
 
-static void add_extents_to_file(fsfile f, rangemap rm)
+static fs_status add_extents_to_file(fsfile f, rangemap rm)
 {
     tfs_debug("%s: tuple %p\n", __func__, f->md);
     rangemap_foreach(rm, node) {
         rangemap_remove_node(rm, node);
-        add_extent_to_file(f, (extent) node);
+        fs_status s = add_extent_to_file(f, (extent) node);
+        if (s != FS_STATUS_OK)
+            return s;
     }
+    return FS_STATUS_OK;
 }
 
 /* no longer async, but keep completion to match dealloc... */
@@ -807,11 +825,12 @@ void filesystem_alloc(filesystem fs, tuple t, long offset, long len,
             goto done;
     }
 
-    add_extents_to_file(f, new_rm);
+    status = add_extents_to_file(f, new_rm);
+    if (status != FS_STATUS_OK)
+        goto done;
     u64 end = offset + len;
     if (!keep_size && (end > fsfile_get_length(f))) {
-        fsfile_set_length(f, end);
-        log_write_eav(fs->tl, t, sym(filelength), value_from_u64(fs->h, end));
+        status = filesystem_truncate(fs, f, end);
     }
 done:
     deallocate_rangemap(new_rm, status == FS_STATUS_OK ? stack_closure(assert_no_node) :
@@ -856,7 +875,8 @@ static void cleanup_directory(tuple dir)
     }
 }
 
-static void fs_set_dir_entry(filesystem fs, tuple parent, symbol name_sym, tuple child)
+static fs_status fs_set_dir_entry(filesystem fs, tuple parent, symbol name_sym,
+                                  tuple child)
 {
     if (child) {
         /* If this is a directory, remove its . and .. directory entries, which
@@ -864,26 +884,35 @@ static void fs_set_dir_entry(filesystem fs, tuple parent, symbol name_sym, tuple
         cleanup_directory(child);
     }
     tuple c = children(parent);
-    table_set(c, name_sym, child);
-    log_write_eav(fs->tl, c, name_sym, child);
+    fs_status s = filesystem_write_eav(fs, c, name_sym, child);
+    if (s == FS_STATUS_OK)
+        table_set(c, name_sym, child);
     if (child) {
         /* If this is a directory, re-add its . and .. directory entries. */
         fixup_directory(parent, child);
     }
+    return s;
 }
 
-void do_mkentry(filesystem fs, tuple parent, const char *name, tuple entry, boolean persistent)
+fs_status do_mkentry(filesystem fs, tuple parent, const char *name, tuple entry,
+                     boolean persistent)
 {
     symbol name_sym = sym_this(name);
     tuple c = children(parent);
-    table_set(c, name_sym, entry);
+    fs_status s;
 
     /* XXX rather than ignore, there should be a wakeup on a sync blockq */
     if (persistent) {
-        log_write_eav(fs->tl, c, name_sym, entry);
+        s = filesystem_write_eav(fs, c, name_sym, entry);
+    } else {
+        table_set(entry, sym(no_encode), null_value);
+        s = FS_STATUS_OK;
     }
 
+    if (s == FS_STATUS_OK)
+        table_set(c, name_sym, entry);
     fixup_directory(parent, entry);
+    return s;
 }
 
 fs_status filesystem_mkentry(filesystem fs, tuple cwd, const char *fp, tuple entry, boolean persistent, boolean recursive)
@@ -911,7 +940,9 @@ fs_status filesystem_mkentry(filesystem fs, tuple cwd, const char *fp, tuple ent
                     /* create intermediate directory */
                     tuple dir = fs_new_entry(fs);
                     table_set(dir, sym(children), allocate_tuple());
-                    do_mkentry(fs, parent, token, dir, persistent);
+                    status = do_mkentry(fs, parent, token, dir, persistent);
+                    if (status != FS_STATUS_OK)
+                        break;
 
                     parent = dir;
                     continue;
@@ -922,7 +953,7 @@ fs_status filesystem_mkentry(filesystem fs, tuple cwd, const char *fp, tuple ent
                 break;
             }
 
-            do_mkentry(fs, parent, token, entry, persistent);
+            status = do_mkentry(fs, parent, token, entry, persistent);
             break;
         }
 
@@ -952,15 +983,20 @@ fs_status filesystem_mkdirpath(filesystem fs, tuple cwd, const char *fp,
     /* 'make it a folder' by attaching a children node to the tuple */
     table_set(dir, sym(children), allocate_tuple());
 
-    return filesystem_mkentry(fs, cwd, fp, dir, persistent, false);
+    return filesystem_mkentry(fs, cwd, fp, dir, persistent, true);
 }
 
 tuple filesystem_mkdir(filesystem fs, tuple parent, const char *name)
 {
     tuple dir = fs_new_entry(fs);
     table_set(dir, sym(children), allocate_tuple());
-    fs_set_dir_entry(fs, parent, sym_this(name), dir);
-    return dir;
+    if (fs_set_dir_entry(fs, parent, sym_this(name), dir) == FS_STATUS_OK) {
+        return dir;
+    } else {
+        cleanup_directory(dir);
+        destruct_tuple(dir, true);
+        return 0;
+    }
 }
 
 fsfile allocate_fsfile(filesystem fs, tuple md);
@@ -968,22 +1004,18 @@ fsfile allocate_fsfile(filesystem fs, tuple md);
 tuple filesystem_creat(filesystem fs, tuple parent, const char *name)
 {
     tuple dir = fs_new_entry(fs);
-    static buffer off = 0;
-
-    if (!off)
-        off = wrap_buffer_cstring(fs->h, "0");
 
     /* 'make it a file' by adding an empty extents list */
     table_set(dir, sym(extents), allocate_tuple());
-    table_set(dir, sym(filelength), off);
 
-    /* record tuple independently so that tlog read can detect the new file */
-    log_write(fs->tl, dir);
+    if (fs_set_dir_entry(fs, parent, sym_this(name), dir) == FS_STATUS_OK) {
+        fsfile f = allocate_fsfile(fs, dir);
+        fsfile_set_length(f, 0);
+    } else {
+        destruct_tuple(dir, true);
+        return 0;
+    }
 
-    fsfile f = allocate_fsfile(fs, dir);
-    fsfile_set_length(f, 0);
-
-    fs_set_dir_entry(fs, parent, sym_this(name), dir);
     return dir;
 }
 
@@ -992,26 +1024,32 @@ tuple filesystem_symlink(filesystem fs, tuple parent, const char *name,
 {
     tuple link = fs_new_entry(fs);
     table_set(link, sym(linktarget), buffer_cstring(fs->h, target));
-    fs_set_dir_entry(fs, parent, sym_this(name), link);
-    return link;
+    if (fs_set_dir_entry(fs, parent, sym_this(name), link) == FS_STATUS_OK) {
+        return link;
+    } else {
+        destruct_tuple(link, true);
+        return 0;
+    }
 }
 
-void filesystem_delete(filesystem fs, tuple parent, symbol sym)
+fs_status filesystem_delete(filesystem fs, tuple parent, symbol sym)
 {
-    fs_set_dir_entry(fs, parent, sym, 0);
+    return fs_set_dir_entry(fs, parent, sym, 0);
 }
 
-void filesystem_rename(filesystem fs, tuple oldparent, symbol oldsym,
+fs_status filesystem_rename(filesystem fs, tuple oldparent, symbol oldsym,
                        tuple newparent, const char *newname)
 {
     tuple t = lookup(oldparent, oldsym);
     assert(t);
     symbol newchild_sym = sym_this(newname);
-    fs_set_dir_entry(fs, oldparent, oldsym, 0);
-    fs_set_dir_entry(fs, newparent, newchild_sym, t);
+    fs_status s = fs_set_dir_entry(fs, newparent, newchild_sym, t);
+    if (s == FS_STATUS_OK)
+        s = fs_set_dir_entry(fs, oldparent, oldsym, 0);
+    return s;
 }
 
-void filesystem_exchange(filesystem fs, tuple parent1, symbol sym1,
+fs_status filesystem_exchange(filesystem fs, tuple parent1, symbol sym1,
                          tuple parent2, symbol sym2)
 {
     tuple child1;
@@ -1020,8 +1058,30 @@ void filesystem_exchange(filesystem fs, tuple parent1, symbol sym1,
     tuple child2;
     child2 = lookup(parent2, sym2);
     assert(child2);
-    fs_set_dir_entry(fs, parent1, sym1, child2);
-    fs_set_dir_entry(fs, parent2, sym2, child1);
+    fs_status s = fs_set_dir_entry(fs, parent1, sym1, child2);
+    if (s == FS_STATUS_OK)
+        s = fs_set_dir_entry(fs, parent2, sym2, child1);
+    return s;
+}
+
+void filesystem_log_rebuild(filesystem fs, log new_tl, status_handler sh)
+{
+    tfs_debug("%s(%F)\n", __func__, sh);
+    cleanup_directory(fs->root);
+    if (log_write(new_tl, fs->root)) {
+        fs->temp_log = new_tl;
+        log_flush(new_tl, sh);
+    } else {
+        apply(sh, timm("result", "failed to write log"));
+    }
+    fixup_directory(fs->root, fs->root);
+}
+
+void filesystem_log_rebuild_done(filesystem fs, log new_tl)
+{
+    tfs_debug("%s\n", __func__);
+    fs->tl = new_tl;
+    fs->temp_log = 0;
 }
 
 #endif /* !TFS_READ_ONLY */
@@ -1067,7 +1127,8 @@ closure_function(2, 1, void, log_complete,
     tfs_debug("%s: complete %p, fs %p, status %v\n", __func__, bound(fc), bound(fs), s);
     filesystem fs = bound(fs);
 #ifndef TFS_READ_ONLY
-    fixup_directory(fs->root, fs->root);
+    if (is_ok(s))
+        fixup_directory(fs->root, fs->root);
 #endif
     apply(bound(fc), fs, s);
     closure_finish();
@@ -1076,13 +1137,16 @@ closure_function(2, 1, void, log_complete,
 closure_function(0, 2, void, ignore_io,
                  status, s, bytes, length) {}
 
+void filesystem_get_uuid(filesystem fs, u8 *uuid)
+{
+    runtime_memcpy(uuid, fs->uuid, UUID_LEN);
+}
+
 void create_filesystem(heap h,
                        u64 blocksize,
                        u64 size,
                        block_io read,
                        block_io write,
-                       pagecache pc,
-                       tuple root,
                        boolean initialize,
                        filesystem_complete complete)
 {
@@ -1093,22 +1157,21 @@ void create_filesystem(heap h,
     if (!ignore_io_status)
         ignore_io_status = closure(h, ignore_io);
     fs->files = allocate_table(h, identity_key, pointer_equal);
-    fs->extents = allocate_table(h, identity_key, pointer_equal);
-    fs->zero_page = pagecache_get_zero_page(pc);
+    fs->zero_page = pagecache_get_zero_page();
     assert(fs->zero_page);
     fs->r = read;
-    fs->pc = pc;
-    fs->root = root;
-    fs->page_order = pagecache_get_page_order(pc);
+    fs->root = 0;
+    fs->page_order = pagecache_get_page_order();
     fs->size = size;
     assert((blocksize & (blocksize - 1)) == 0);
     fs->blocksize_order = find_order(blocksize);
-    fs->pv = pagecache_allocate_volume(pc, size, fs->blocksize_order);
+    fs->pv = pagecache_allocate_volume(size, fs->blocksize_order);
     assert(fs->pv != INVALID_ADDRESS);
 #ifndef TFS_READ_ONLY
     fs->w = write;
     fs->storage = create_id_heap(h, h, 0, size >> fs->blocksize_order, 1);
     assert(fs->storage != INVALID_ADDRESS);
+    fs->temp_log = 0;
 #else
     fs->w = 0;
     fs->storage = 0;
@@ -1127,6 +1190,7 @@ closure_function(1, 1, void, dealloc_extent_node,
 
 void deallocate_fsfile(filesystem fs, fsfile f)
 {
+    table_set(fs->files, f->md, 0);
     deallocate_rangemap(f->extentmap, stack_closure(dealloc_extent_node, fs));
     pagecache_deallocate_node(f->cache_node);
     deallocate(fs->h, f, sizeof(*f));
@@ -1139,29 +1203,12 @@ void destroy_filesystem(filesystem fs)
     tfs_debug("%s %p\n", __func__, fs);
     log_destroy(fs->tl);
     pagecache_dealloc_volume(fs->pv);
-    deallocate_table(fs->extents);
+    if (fs->root) {
+        cleanup_directory(fs->root);
+        destruct_tuple(fs->root, true);
+    }
     table_foreach(fs->files, k, v) {
-        tuple f = k;
-        table_foreach(f, k, v) {
-            if (k == sym(extents)) {
-                table extents = v;
-                table_foreach(extents, k, v) {
-                    (void)k;
-                    tuple ex = v;
-                    table_foreach(ex, k, v) {
-                        if (k == sym(length) || k == sym(offset) ||
-                                k == sym(allocated))
-                            deallocate_buffer(v);
-                    }
-                    deallocate_tuple(ex);
-                }
-                deallocate_tuple(extents);
-            }
-            else if (k == sym(children))
-                deallocate_tuple(v);
-            else if (u64_from_pointer(v) >= KMEM_BASE)
-                deallocate_buffer(v);
-        }
+        (void)k;
         deallocate_fsfile(fs, v);
     }
     deallocate_table(fs->files);

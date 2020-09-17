@@ -1,11 +1,16 @@
-#define resolve_dir(__dirfd, __path) ({ \
+#define resolve_dir(__fs, __dirfd, __path) ({ \
     tuple cwd; \
-    if (*(__path) == '/') cwd = filesystem_getroot(current->p->fs); \
-    else if (__dirfd == AT_FDCWD) cwd = current->p->cwd; \
-    else { \
+    if (*(__path) == '/') { \
+        __fs = current->p->root_fs; \
+        cwd = filesystem_getroot(__fs); \
+    } else if (__dirfd == AT_FDCWD) { \
+        __fs = current->p->cwd_fs; \
+        cwd = current->p->cwd; \
+    } else { \
         file f = resolve_fd(current->p, __dirfd); \
         tuple t = file_get_meta(f); \
         if (!is_dir(t)) return set_syscall_error(current, ENOTDIR); \
+        __fs = f->fs; \
         cwd = t; \
     } \
     cwd; \
@@ -88,23 +93,33 @@ static inline boolean dirname_from_path(buffer dest, const char *path)
     return true;
 }
 
+sysreturn sysreturn_from_fs_status(fs_status s);
 sysreturn sysreturn_from_fs_status_value(status s);
 
-int resolve_cstring(tuple cwd, const char *f, tuple *entry, tuple *parent);
+tuple lookup_follow_mounts(filesystem *fs, tuple t, symbol a, tuple *p);
+
+int resolve_cstring(filesystem *fs, tuple cwd, const char *f, tuple *entry,
+                    tuple *parent);
 
 /* Same as resolve_cstring(), except that if the entry is a symbolic link this
  * function follows the link (recursively). */
-int resolve_cstring_follow(tuple cwd, const char *f, tuple *entry,
+int resolve_cstring_follow(filesystem *fs, tuple cwd, const char *f, tuple *entry,
         tuple *parent);
 
-int filesystem_follow_links(tuple link, tuple parent, tuple *target);
+int filesystem_follow_links(filesystem *fs, tuple link, tuple parent,
+                            tuple *target);
 
 int filesystem_add_tuple(const char *path, tuple t);
 
 static inline int filesystem_get_tuple(const char *path, tuple *t)
 {
-    return resolve_cstring(current->p->cwd, path, t, 0);
+    return resolve_cstring(0, current->p->cwd, path, t, 0);
 }
+
+/* Perform read-ahead following a userspace read request.
+ * offset and len arguments refer to the byte range being read from userspace,
+ * not to the range to be read ahead. */
+void file_readahead(file f, u64 offset, u64 len);
 
 sysreturn symlink(const char *target, const char *linkpath);
 sysreturn symlinkat(const char *target, int dirfd, const char *linkpath);
@@ -116,3 +131,5 @@ sysreturn statfs(const char *path, struct statfs *buf);
 sysreturn fstatfs(int fd, struct statfs *buf);
 
 sysreturn fallocate(int fd, int mode, long offset, long len);
+
+sysreturn fadvise64(int fd, s64 off, u64 len, int advice);
